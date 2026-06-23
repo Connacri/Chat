@@ -1,0 +1,36 @@
+name: Release Nexus
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Use Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18.x'
+      - name: Install & Build Web
+        run: |
+          npm install
+          npm run build
+          zip -r nexus-web-${GITHUB_REF_NAME}.zip dist/
+      - name: Build Android
+        run: |
+          npx cap add android || true
+          npx cap sync android
+          cd android && ./gradlew assembleDebug
+          cp android/app/build/outputs/apk/debug/app-debug.apk ./nexus-chat-${GITHUB_REF_NAME}.apk
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            nexus-web-${GITHUB_REF_NAME}.zip
+            nexus-chat-${GITHUB_REF_NAME}.apk
+          body: "Release automatique de la version ${GITHUB_REF_NAME}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
