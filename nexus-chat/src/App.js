@@ -1,3 +1,4 @@
+import './index.css';
 import React from 'react';
 import { useNexus } from './hooks/useNexus.js';
 import ProfileCard from './components/ProfileCard.jsx';

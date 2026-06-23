@@ -31,3 +31,16 @@ All entities use a Last-Write-Wins (LWW) element set for state and Append-only l
 
 ## 4. DevOps (CI/CD)
 The project includes GitHub Actions for automated testing and Docker for containerized deployment (Web/Desktop).
+
+
+## 5. Deployment & Distribution
+- **Website**: Built using Vite. The CI/CD pipeline generates the `dist` folder.
+- **Android**: Integrated with Capacitor. The pipeline generates a debug APK (`app-debug.apk`).
+- **Automation**: GitHub Actions automatically builds both platforms on every push to `main` or `release/*`.
+
+## 6. How to Use
+1. **Clone** the repository.
+2. Run `npm install` to set up dependencies.
+3. Use `npm run dev` for local web development.
+4. Use `npm run build` to prepare for production.
+5. For Android, sync with `npm run android:sync` and open in Android Studio.
