@@ -4,6 +4,8 @@
 // ============================================================
 import "./index.css";
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { firestore } from "./core/firebase";
+import { collection, query, where, getDocs, limit, doc, setDoc } from "firebase/firestore";
 /////
 // ─── CRDT Engine ────────────────────────────────────────────
 const CRDT = {
@@ -239,7 +241,14 @@ export default function App() {
   const [selectedChat, setSelectedChat] = useState(null);
   const [isOnline, setIsOnline] = useState(true);
   const [p2p, setP2p] = useState(null);
-  const [nodeId] = useState(() => uid());
+  const [nodeId] = useState(() => {
+    let id = localStorage.getItem('nexus_nodeId');
+    if (!id) {
+      id = uid();
+      localStorage.setItem('nexus_nodeId', id);
+    }
+    return id;
+  });
   const [toast, setToast] = useState(null);
   const [otpTarget, setOtpTarget] = useState(null);
   const [pendingOtp, setPendingOtp] = useState(null);
@@ -289,6 +298,39 @@ export default function App() {
       }
     })();
   }, []);
+
+  // ── Sync users from Firestore ──
+  useEffect(() => {
+    if (!currentUser) return;
+    const syncUsers = async () => {
+      try {
+        const usersRef = collection(firestore, "users");
+        const q = query(usersRef, limit(50));
+        const querySnapshot = await getDocs(q);
+        const fetchedUsers = [];
+        querySnapshot.forEach((doc) => {
+          fetchedUsers.push(doc.data());
+        });
+        
+        // Save to IndexedDB
+        for (const u of fetchedUsers) {
+          await db.put("users", u);
+        }
+        
+        // Update state
+        setUsers((prev) => {
+          const next = { ...prev };
+          fetchedUsers.forEach((u) => {
+            next[u.id] = u;
+          });
+          return next;
+        });
+      } catch (e) {
+        console.error("Error syncing users from Firestore on start:", e);
+      }
+    };
+    syncUsers();
+  }, [currentUser]);
 
   // ── P2P init ──
   useEffect(() => {
@@ -358,6 +400,13 @@ export default function App() {
     };
     await db.put("users", user);
     await db.put("state", { id: "app", userId: user.id });
+    
+    try {
+      await setDoc(doc(firestore, "users", user.id), user);
+    } catch (e) {
+      console.error("Failed to save user to Firestore on register:", e);
+    }
+
     setUsers((prev) => {
       const next = { ...prev, [user.id]: user };
       broadcast({ users: { [user.id]: user } });
@@ -463,6 +512,13 @@ export default function App() {
   const updateProfile = useCallback(async (updates) => {
     const updated = { ...currentUser, ...updates, ts: now() };
     await db.put("users", updated);
+    
+    try {
+      await setDoc(doc(firestore, "users", updated.id), updated);
+    } catch (e) {
+      console.error("Failed to update user in Firestore:", e);
+    }
+
     setCurrentUser(updated);
     setUsers((prev) => {
       const next = { ...prev, [updated.id]: updated };
@@ -489,7 +545,7 @@ export default function App() {
 
   // ─── Props bundle ─────────────────────────────────────────
   const ctx = {
-    view, setView, currentUser, users, messages, groups, friends,
+    view, setView, currentUser, users, setUsers, messages, groups, friends,
     selectedChat, setSelectedChat, isOnline, toast,
     registerUser, logout, sendOtp, verifyOtp, sendMessage,
     addFriend, createGroup, updateProfile, toggleOnline, getLocation,
@@ -1296,9 +1352,31 @@ function AddFriendScreen({ ctx }) {
   const myId = ctx.currentUser?.id;
   const myFriends = ctx.friends[myId] || [];
 
-  const search = () => {
-    const found = Object.values(ctx.users).find((u) => u.phone === phone.trim() && u.id !== myId);
-    setResult(found || "not_found");
+  const search = async () => {
+    const foundLocal = Object.values(ctx.users).find((u) => u.phone === phone.trim() && u.id !== myId);
+    if (foundLocal) {
+      setResult(foundLocal);
+      return;
+    }
+
+    try {
+      const usersRef = collection(firestore, "users");
+      const q = query(usersRef, where("phone", "==", phone.trim()));
+      const querySnapshot = await getDocs(q);
+      
+      if (!querySnapshot.empty) {
+        const docData = querySnapshot.docs[0].data();
+        if (docData.id !== myId) {
+          await db.put("users", docData);
+          ctx.setUsers((prev) => ({ ...prev, [docData.id]: docData }));
+          setResult(docData);
+          return;
+        }
+      }
+    } catch (e) {
+      console.error("Error searching in Firestore:", e);
+    }
+    setResult("not_found");
   };
 
   const myQR = `p2p-app://add-friend?peerId=${myId}`;

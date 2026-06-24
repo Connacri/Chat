@@ -9,6 +9,7 @@
 import { initializeApp } from 'firebase/app';
 import { getAuth, GoogleAuthProvider, signInWithPopup, signOut } from 'firebase/auth';
 import { getMessaging, getToken, onMessage } from 'firebase/messaging';
+import { getFirestore } from 'firebase/firestore';
 
 // ─── Colle ici ta config Firebase ────────────────────────────────────────────
 const firebaseConfig = {
@@ -23,6 +24,7 @@ const firebaseConfig = {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const app = initializeApp(firebaseConfig);
+export const firestore = getFirestore(app);
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 export const auth = getAuth(app);
