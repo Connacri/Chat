@@ -1,11 +1,18 @@
 import { db } from './db.js';
+import { nexus } from './nexus.js';
 
 export class FriendManager {
   async addFriend(myId, friendId) {
-    const list = await db.get('friends', myId) || { id: myId, list: [] };
+    const list = await db.get('friends', myId) || { id: myId, list: [], ts: Date.now() };
     if (!list.list.includes(friendId)) {
       list.list.push(friendId);
+      list.ts = Date.now();
       await db.put('friends', list);
+      
+      // Gossip the updated friend list to peers
+      if (nexus.network) {
+        nexus.network.gossip({ friends: { [myId]: list } });
+      }
       return true;
     }
     return false;

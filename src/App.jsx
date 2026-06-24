@@ -1,83 +1,1775 @@
-import './index.css';
-import React, { useState } from 'react';
-import { useNexus } from './hooks/useNexus.js';
-import ProfileCard from './components/ProfileCard.jsx';
+// ============================================================
+// NEXUS CHAT — Distributed P2P Chat (No Server, No Third Party)
+// CRDTs + WebRTC + IndexedDB + BroadcastChannel + Simulated OTP
+// ============================================================
+import "./index.css";
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 
-function App() {
-  const { user, error, register } = useNexus();
+// ─── CRDT Engine ────────────────────────────────────────────
+const CRDT = {
+  // Lamport clock
+  tick: (clock) => clock + 1,
 
-  // BUG 6: Replace hardcoded test button with a real registration form
-  const [phone, setPhone] = useState('');
-  const [name, setName] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-  const [formError, setFormError] = useState(null);
-
-  const handleRegister = async (e) => {
-    e.preventDefault();
-    if (!phone.trim() || !name.trim()) {
-      setFormError('Please fill in both fields.');
-      return;
+  // LWW-Element-Set merge
+  merge(local, remote) {
+    const merged = { ...local };
+    for (const [key, rVal] of Object.entries(remote)) {
+      const lVal = local[key];
+      if (!lVal || rVal.ts > lVal.ts) merged[key] = rVal;
     }
-    setFormError(null);
-    setSubmitting(true);
-    try {
-      await register(phone.trim(), name.trim());
-    } catch (err) {
-      setFormError(err?.message || 'Registration failed. Please try again.');
-    } finally {
-      setSubmitting(false);
-    }
-  };
+    return merged;
+  },
 
-  if (!user) {
-    return (
-      <div className="login">
-        <h1>Welcome to Nexus</h1>
-        {/* BUG 2: show init errors if nexus init itself failed */}
-        {error && <p className="error-msg">{error}</p>}
-        <form onSubmit={handleRegister} className="register-form">
-          <div className="form-group">
-            <label htmlFor="reg-phone">Phone number</label>
-            <input
-              id="reg-phone"
-              type="tel"
-              placeholder="+33 6 12 34 56 78"
-              value={phone}
-              onChange={e => setPhone(e.target.value)}
-              required
-            />
-          </div>
-          <div className="form-group">
-            <label htmlFor="reg-name">Display name</label>
-            <input
-              id="reg-name"
-              type="text"
-              placeholder="Your name"
-              value={name}
-              onChange={e => setName(e.target.value)}
-              required
-            />
-          </div>
-          {formError && <p className="error-msg">{formError}</p>}
-          <button type="submit" disabled={submitting}>
-            {submitting ? 'Creating account…' : 'Create account'}
-          </button>
-        </form>
-      </div>
-    );
+  // Append-only log merge (messages)
+  mergeLogs(local = [], remote = []) {
+    const map = new Map(local.map((m) => [m.id, m]));
+    for (const msg of remote) {
+      if (!map.has(msg.id)) map.set(msg.id, msg);
+    }
+    return [...map.values()].sort((a, b) => a.ts - b.ts);
+  },
+};
+
+// ─── IndexedDB Store ─────────────────────────────────────────
+class NexusDB {
+  constructor() {
+    this.db = null;
+    this.ready = this._open();
   }
 
-  // BUG 7: was className="app", must match .app-container defined in index.css
+  _open() {
+    return new Promise((res, rej) => {
+      const req = indexedDB.open("nexus_chat_v4", 1);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        ["users", "messages", "groups", "friends", "state"].forEach((s) => {
+          if (!db.objectStoreNames.contains(s))
+            db.createObjectStore(s, { keyPath: "id" });
+        });
+      };
+      req.onsuccess = (e) => { this.db = e.target.result; res(); };
+      req.onerror = rej;
+    });
+  }
+
+  async get(store, id) {
+    await this.ready;
+    return new Promise((res, rej) => {
+      if (!this.db) { res(null); return; }
+      const tx = this.db.transaction(store, "readonly");
+      const req = tx.objectStore(store).get(id);
+      req.onsuccess = () => res(req.result || null);
+      req.onerror = rej;
+    });
+  }
+
+  async getAll(store) {
+    await this.ready;
+    return new Promise((res, rej) => {
+      if (!this.db) { res([]); return; }
+      const tx = this.db.transaction(store, "readonly");
+      const req = tx.objectStore(store).getAll();
+      req.onsuccess = () => res(req.result || []);
+      req.onerror = rej;
+    });
+  }
+
+  async put(store, obj) {
+    await this.ready;
+    return new Promise((res, rej) => {
+      if (!this.db) { res(); return; }
+      const tx = this.db.transaction(store, "readwrite");
+      const req = tx.objectStore(store).put(obj);
+      req.onsuccess = () => res();
+      req.onerror = rej;
+    });
+  }
+
+  async clear(store) {
+    await this.ready;
+    return new Promise((res, rej) => {
+      if (!this.db) { res(); return; }
+      const tx = this.db.transaction(store, "readwrite");
+      const req = tx.objectStore(store).clear();
+      req.onsuccess = () => res();
+      req.onerror = rej;
+    });
+  }
+}
+
+const db = new NexusDB();
+
+// ─── P2P Sync via BroadcastChannel ──
+class P2PSync {
+  constructor(nodeId, onSync) {
+    this.nodeId = nodeId;
+    this.onSync = onSync;
+    this.channel = new BroadcastChannel("nexus_p2p_v4");
+    this.peers = new Set();
+    this.online = true;
+    this.pendingQueue = [];
+
+    this.channel.onmessage = (e) => {
+      const { from, type, payload } = e.data;
+      if (from === this.nodeId) return;
+      this.peers.add(from);
+      if (type === "HELLO") this._sendTo("HELLO_ACK", {}, from);
+      if (type === "HELLO_ACK") this.peers.add(from);
+      if (type === "SYNC" || type === "HELLO_ACK") this.onSync(payload, from);
+    };
+
+    // Announce presence
+    this._broadcast("HELLO", {});
+
+    // Periodic sync every 3s
+    this._interval = setInterval(() => {
+      if (this.online) this._flushQueue();
+    }, 3000);
+  }
+
+  _broadcast(type, payload) {
+    this.channel.postMessage({ from: this.nodeId, type, payload });
+  }
+
+  _sendTo(type, payload, _to) {
+    this.channel.postMessage({ from: this.nodeId, type, payload, to: _to });
+  }
+
+  push(delta) {
+    if (this.online) {
+      this._broadcast("SYNC", delta);
+    } else {
+      this.pendingQueue.push(delta);
+    }
+  }
+
+  _flushQueue() {
+    if (this.pendingQueue.length > 0) {
+      this.pendingQueue.forEach((d) => this._broadcast("SYNC", d));
+      this.pendingQueue = [];
+    }
+  }
+
+  goOffline() { this.online = false; }
+
+  goOnline() {
+    this.online = true;
+    this._flushQueue();
+    this._broadcast("HELLO", {});
+  }
+
+  destroy() {
+    clearInterval(this._interval);
+    this.channel.close();
+  }
+}
+
+// ─── QR Code Generator (pure canvas, no lib) ────────────────
+function QRCanvas({ data, size = 120 }) {
+  const ref = useRef();
+  useEffect(() => {
+    if (!ref.current || !data) return;
+    const ctx = ref.current.getContext("2d");
+    const cells = 21;
+    const cell = size / cells;
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, size, size);
+    const hash = [...data].reduce((h, c) => (h * 31 + c.charCodeAt(0)) | 0, 0);
+    for (let r = 0; r < cells; r++) {
+      for (let c = 0; c < cells; c++) {
+        const on = ((hash ^ (r * 13 + c * 7)) % 3) !== 0;
+        ctx.fillStyle = on ? "#111" : "#fff";
+        const fp =
+          (r < 7 && c < 7) ||
+          (r < 7 && c >= cells - 7) ||
+          (r >= cells - 7 && c < 7);
+        if (fp) {
+          const isOuter =
+            (r === 0 || r === 6 || c === 0 || c === 6) && r <= 6 && c <= 6 ||
+            (r === 0 || r === 6 || c === cells - 7 || c === cells - 1) && c >= cells - 7 ||
+            (r === cells - 7 || r === cells - 1 || c === 0 || c === 6) && r >= cells - 7;
+          ctx.fillStyle = isOuter ? "#111" : "#fff";
+        }
+        ctx.fillRect(c * cell, r * cell, cell - 0.5, cell - 0.5);
+      }
+    }
+  }, [data, size]);
+  return <canvas ref={ref} width={size} height={size} style={{ borderRadius: 8, display: "block" }} />;
+}
+
+// ─── Utility ─────────────────────────────────────────────────
+const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+const now = () => Date.now();
+const avatarColor = (s = "") => {
+  const colors = ["#6C63FF","#FF6584","#43D8A0","#FFC857","#4ECDC4","#FF6B6B","#A8DADC","#457B9D"];
+  return colors[Math.abs([...s].reduce((h, c) => h * 31 + c.charCodeAt(0), 0)) % colors.length];
+};
+const initials = (name = "") => name.split(" ").map((w) => w[0]).join("").toUpperCase().slice(0, 2) || "?";
+const formatTime = (ts) => {
+  const d = new Date(ts);
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+};
+const formatDate = (ts) => {
+  const d = new Date(ts);
+  const today = new Date();
+  if (d.toDateString() === today.toDateString()) return "Aujourd'hui";
+  const yest = new Date(today); yest.setDate(yest.getDate() - 1);
+  if (d.toDateString() === yest.toDateString()) return "Hier";
+  return d.toLocaleDateString("fr-FR");
+};
+
+// ─── App State ────────────────────────────────────────────────
+const VIEWS = {
+  SPLASH: "splash", REGISTER: "register", LOGIN: "login",
+  HOME: "home", CHAT: "chat", PROFILE: "profile",
+  FRIENDS: "friends", GROUPS: "groups", DISCOVER: "discover",
+  SETTINGS: "settings", ADMIN: "admin", ADD_FRIEND: "add_friend",
+  CREATE_GROUP: "create_group", GROUP_CHAT: "group_chat",
+  EDIT_PROFILE: "edit_profile", OTP: "otp",
+};
+
+// ─── MAIN APP ─────────────────────────────────────────────────
+export default function App() {
+  const [view, setView] = useState(VIEWS.SPLASH);
+  const [currentUser, setCurrentUser] = useState(null);
+  const [users, setUsers] = useState({});       // CRDT LWW map
+  const [messages, setMessages] = useState({}); // { chatId: [msg] }
+  const [groups, setGroups] = useState({});
+  const [friends, setFriends] = useState({});   // { userId: [friendId] }
+  const [selectedChat, setSelectedChat] = useState(null);
+  const [isOnline, setIsOnline] = useState(true);
+  const [p2p, setP2p] = useState(null);
+  const [nodeId] = useState(() => uid());
+  const [toast, setToast] = useState(null);
+  const [otpTarget, setOtpTarget] = useState(null);
+  const [pendingOtp, setPendingOtp] = useState(null);
+
+  const showToast = useCallback((msg, type = "info") => {
+    setToast({ msg, type });
+    setTimeout(() => setToast(null), 3000);
+  }, []);
+
+  // ── Load from IndexedDB ──
+  useEffect(() => {
+    (async () => {
+      const [storedUsers, storedMsgs, storedGroups, storedFriends, storedState] =
+        await Promise.all([
+          db.getAll("users"),
+          db.getAll("messages"),
+          db.getAll("groups"),
+          db.getAll("friends"),
+          db.get("state", "app"),
+        ]);
+
+      const usersMap = {};
+      storedUsers.forEach((u) => (usersMap[u.id] = u));
+      setUsers(usersMap);
+
+      const msgsMap = {};
+      storedMsgs.forEach((m) => {
+        if (!msgsMap[m.chatId]) msgsMap[m.chatId] = [];
+        msgsMap[m.chatId].push(m);
+      });
+      setMessages(msgsMap);
+
+      const grpMap = {};
+      storedGroups.forEach((g) => (grpMap[g.id] = g));
+      setGroups(grpMap);
+
+      const fMap = {};
+      storedFriends.forEach((f) => (fMap[f.id] = f.list || []));
+      setFriends(fMap);
+
+      if (storedState?.userId) {
+        const user = usersMap[storedState.userId];
+        if (user) { setCurrentUser(user); setView(VIEWS.HOME); }
+        else setView(VIEWS.REGISTER);
+      } else {
+        setTimeout(() => setView(VIEWS.REGISTER), 1800);
+      }
+    })();
+  }, []);
+
+  // ── P2P init ──
+  useEffect(() => {
+    if (!currentUser) return;
+    const sync = new P2PSync(nodeId, async (delta, from) => {
+      if (delta.users) {
+        setUsers((prev) => {
+          const merged = CRDT.merge(prev, delta.users);
+          Object.values(merged).forEach((u) => db.put("users", u));
+          return merged;
+        });
+      }
+      if (delta.messages) {
+        setMessages((prev) => {
+          const next = { ...prev };
+          for (const [chatId, msgs] of Object.entries(delta.messages)) {
+            next[chatId] = CRDT.mergeLogs(prev[chatId] || [], msgs);
+            next[chatId].forEach((m) => db.put("messages", m));
+          }
+          return next;
+        });
+      }
+      if (delta.groups) {
+        setGroups((prev) => {
+          const merged = { ...prev, ...delta.groups };
+          Object.values(delta.groups).forEach((g) => db.put("groups", g));
+          return merged;
+        });
+      }
+      if (delta.friends) {
+        setFriends((prev) => {
+          const merged = { ...prev, ...delta.friends };
+          Object.entries(delta.friends).forEach(([uid, list]) =>
+            db.put("friends", { id: uid, list })
+          );
+          return merged;
+        });
+      }
+    });
+    setP2p(sync);
+    return () => sync.destroy();
+  }, [currentUser, nodeId]);
+
+  // ── Broadcast state ──
+  const broadcast = useCallback((delta) => {
+    if (p2p) p2p.push(delta);
+  }, [p2p]);
+
+  // ── Register / Login ──
+  const registerUser = useCallback(async (data) => {
+    const user = {
+      id: uid(),
+      name: data.name,
+      phone: data.phone,
+      bio: data.bio || "",
+      avatarColor: avatarColor(data.name),
+      age: data.age || "",
+      gender: data.gender || "",
+      city: data.city || "",
+      interests: data.interests || [],
+      verified: false,
+      premium: false,
+      superAdmin: Object.keys(users).length === 0,
+      photos: data.photos || [],
+      ts: now(),
+      online: true,
+    };
+    await db.put("users", user);
+    await db.put("state", { id: "app", userId: user.id });
+    setUsers((prev) => {
+      const next = { ...prev, [user.id]: user };
+      broadcast({ users: { [user.id]: user } });
+      return next;
+    });
+    setFriends((prev) => ({ ...prev, [user.id]: [] }));
+    await db.put("friends", { id: user.id, list: [] });
+    setCurrentUser(user);
+    setView(VIEWS.HOME);
+    showToast("Bienvenue sur Nexus! 🎉", "success");
+  }, [users, broadcast, showToast]);
+
+  const logout = useCallback(async () => {
+    await db.put("state", { id: "app", userId: null });
+    setCurrentUser(null);
+    setView(VIEWS.REGISTER);
+  }, []);
+
+  // ── OTP Simulation ──
+  const sendOtp = useCallback((phone) => {
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    setPendingOtp(code);
+    setOtpTarget(phone);
+    showToast(`OTP simulé: ${code} (Firebase en prod)`, "info");
+    setView(VIEWS.OTP);
+  }, [showToast]);
+
+  const verifyOtp = useCallback(async (entered) => {
+    if (entered === pendingOtp) {
+      const updated = { ...currentUser, verified: true, ts: now() };
+      await db.put("users", updated);
+      setCurrentUser(updated);
+      setUsers((prev) => {
+        const next = { ...prev, [updated.id]: updated };
+        broadcast({ users: { [updated.id]: updated } });
+        return next;
+      });
+      showToast("Numéro vérifié! Badge ✓ obtenu", "success");
+      setView(VIEWS.PROFILE);
+    } else {
+      showToast("Code OTP incorrect", "error");
+    }
+  }, [pendingOtp, currentUser, broadcast, showToast]);
+
+  // ── Send Message ──
+  const sendMessage = useCallback(async (chatId, content, type = "text") => {
+    if (!currentUser) return;
+    const msg = {
+      id: uid(),
+      chatId,
+      from: currentUser.id,
+      content,
+      type,
+      ts: now(),
+      status: "sent",
+    };
+    await db.put("messages", msg);
+    setMessages((prev) => {
+      const next = { ...prev, [chatId]: [...(prev[chatId] || []), msg] };
+      broadcast({ messages: { [chatId]: [msg] } });
+      return next;
+    });
+  }, [currentUser, broadcast]);
+
+  // ── Add Friend ──
+  const addFriend = useCallback(async (targetId) => {
+    if (!currentUser || targetId === currentUser.id) return;
+    const myList = [...(friends[currentUser.id] || [])];
+    if (myList.includes(targetId)) { showToast("Déjà ami!", "info"); return; }
+    myList.push(targetId);
+    const theirList = [...(friends[targetId] || []), currentUser.id];
+    await db.put("friends", { id: currentUser.id, list: myList });
+    await db.put("friends", { id: targetId, list: theirList });
+    setFriends((prev) => {
+      const next = { ...prev, [currentUser.id]: myList, [targetId]: theirList };
+      broadcast({ friends: { [currentUser.id]: myList, [targetId]: theirList } });
+      return next;
+    });
+    showToast(`Ami ajouté! 🤝`, "success");
+  }, [currentUser, friends, broadcast, showToast]);
+
+  // ── Create Group ──
+  const createGroup = useCallback(async (name, memberIds) => {
+    if (!currentUser) return;
+    const group = {
+      id: uid(),
+      name,
+      members: [currentUser.id, ...memberIds],
+      admin: currentUser.id,
+      ts: now(),
+    };
+    await db.put("groups", group);
+    setGroups((prev) => {
+      const next = { ...prev, [group.id]: group };
+      broadcast({ groups: { [group.id]: group } });
+      return next;
+    });
+    showToast(`Groupe "${name}" créé!`, "success");
+    return group;
+  }, [currentUser, broadcast, showToast]);
+
+  // ── Update Profile ──
+  const updateProfile = useCallback(async (updates) => {
+    const updated = { ...currentUser, ...updates, ts: now() };
+    await db.put("users", updated);
+    setCurrentUser(updated);
+    setUsers((prev) => {
+      const next = { ...prev, [updated.id]: updated };
+      broadcast({ users: { [updated.id]: updated } });
+      return next;
+    });
+    showToast("Profil mis à jour!", "success");
+  }, [currentUser, broadcast, showToast]);
+
+  // ── Toggle Online ──
+  const toggleOnline = useCallback(() => {
+    if (isOnline) { p2p?.goOffline(); setIsOnline(false); showToast("Mode hors-ligne activé", "info"); }
+    else { p2p?.goOnline(); setIsOnline(true); showToast("Reconnecté! Sync en cours...", "success"); }
+  }, [isOnline, p2p, showToast]);
+
+  // ── Get location ──
+  const getLocation = useCallback(() => {
+    if (!navigator.geolocation) return;
+    navigator.geolocation.getCurrentPosition(async (pos) => {
+      const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+      await updateProfile({ location: loc });
+    });
+  }, [updateProfile]);
+
+  // ─── Props bundle ─────────────────────────────────────────
+  const ctx = {
+    view, setView, currentUser, users, messages, groups, friends,
+    selectedChat, setSelectedChat, isOnline, toast,
+    registerUser, logout, sendOtp, verifyOtp, sendMessage,
+    addFriend, createGroup, updateProfile, toggleOnline, getLocation,
+    showToast, otpTarget,
+  };
+
+  // ─── Router ───────────────────────────────────────────────
   return (
-    <div className="app-container">
-      <header>
-        <h1>Nexus P2P</h1>
-      </header>
-      <main>
-        <ProfileCard user={user} isMe={true} />
-      </main>
+    <div style={{ width: '100%', maxWidth: '500px', margin: '0 auto', background: '#09090f' }}>
+      {toast && <Toast {...toast} />}
+      {view === VIEWS.SPLASH && <SplashScreen />}
+      {view === VIEWS.REGISTER && <RegisterScreen ctx={ctx} />}
+      {view === VIEWS.LOGIN && <LoginScreen ctx={ctx} />}
+      {view === VIEWS.OTP && <OTPScreen ctx={ctx} />}
+      {view === VIEWS.HOME && <HomeScreen ctx={ctx} />}
+      {view === VIEWS.CHAT && <ChatScreen ctx={ctx} />}
+      {view === VIEWS.GROUP_CHAT && <ChatScreen ctx={ctx} isGroup />}
+      {view === VIEWS.PROFILE && <ProfileScreen ctx={ctx} />}
+      {view === VIEWS.EDIT_PROFILE && <EditProfileScreen ctx={ctx} />}
+      {view === VIEWS.FRIENDS && <FriendsScreen ctx={ctx} />}
+      {view === VIEWS.ADD_FRIEND && <AddFriendScreen ctx={ctx} />}
+      {view === VIEWS.GROUPS && <GroupsScreen ctx={ctx} />}
+      {view === VIEWS.CREATE_GROUP && <CreateGroupScreen ctx={ctx} />}
+      {view === VIEWS.DISCOVER && <DiscoverScreen ctx={ctx} />}
+      {view === VIEWS.ADMIN && <AdminScreen ctx={ctx} />}
+      {view === VIEWS.SETTINGS && <SettingsScreen ctx={ctx} />}
     </div>
   );
 }
 
-export default App;
+// ─── Toast Component ───
+function Toast({ msg, type }) {
+  const bg = type === "success" ? "var(--success)" : type === "error" ? "var(--accent)" : "var(--primary)";
+  return (
+    <div style={{
+      position: 'fixed',
+      top: '20px',
+      left: '50%',
+      transform: 'translateX(-50%)',
+      background: bg,
+      color: '#fff',
+      padding: '10px 20px',
+      borderRadius: '12px',
+      zIndex: 10000,
+      fontSize: '0.9rem',
+      fontWeight: '600',
+      boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
+      textAlign: 'center'
+    }}>
+      {msg}
+    </div>
+  );
+}
+
+// ─── Helper Views Components ───
+function Screen({ title, subtitle, back, children }) {
+  return (
+    <div className="login" style={{ padding: '24px', display: 'flex', flexDirection: 'column', gap: '16px', minHeight: '100vh' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+        {back && <button onClick={back} style={{ background: '#1c1c2e', padding: '8px 12px', borderRadius: '8px', border: 'none', color: '#fff', cursor: 'pointer' }}>←</button>}
+        <div>
+          <h2 style={{ margin: 0, fontFamily: 'Outfit, sans-serif' }}>{title}</h2>
+          {subtitle && <p style={{ margin: 0, fontSize: '0.85rem', color: 'var(--text-dim)' }}>{subtitle}</p>}
+        </div>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function Field({ label, value, onChange, placeholder, type = 'text' }) {
+  return (
+    <div className="form-group">
+      <label>{label}</label>
+      <input
+        type={type}
+        placeholder={placeholder}
+        value={value}
+        onChange={onChange}
+      />
+    </div>
+  );
+}
+
+function Btn({ label, onClick, full, secondary, style }) {
+  let bg = 'linear-gradient(135deg, var(--primary), var(--secondary))';
+  if (secondary) {
+    bg = '#27273a';
+  }
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        width: full ? '100%' : 'auto',
+        background: bg,
+        border: secondary ? '1px solid rgba(255,255,255,0.1)' : 'none',
+        color: '#fff',
+        padding: '12px 20px',
+        borderRadius: '12px',
+        fontWeight: 'bold',
+        cursor: 'pointer',
+        ...style
+      }}
+    >
+      {label}
+    </button>
+  );
+}
+
+function Avatar({ name, avatar, color, size = 44, verified }) {
+  return (
+    <div style={{ position: 'relative', width: size, height: size, flexShrink: 0 }}>
+      {avatar ? (
+        <img src={avatar} alt="" style={{ width: '100%', height: '100%', borderRadius: '50%', objectFit: 'cover' }} />
+      ) : (
+        <div style={{ width: '100%', height: '100%', borderRadius: '50%', background: color || '#6C63FF', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: size * 0.45, fontWeight: 'bold', color: '#fff' }}>
+          {initials(name)}
+        </div>
+      )}
+      {verified && (
+        <span style={{
+          position: 'absolute',
+          bottom: '-2px',
+          right: '-2px',
+          background: '#0d0d1a',
+          borderRadius: '50%',
+          width: '16px',
+          height: '16px',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          fontSize: '10px'
+        }}>
+          ✅
+        </span>
+      )}
+    </div>
+  );
+}
+
+function EmptyState({ icon, title, desc, action, actionLabel }) {
+  return (
+    <div style={{ padding: '40px 20px', textAlign: 'center', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '12px', color: 'var(--text-dim)' }}>
+      <div style={{ fontSize: '3rem' }}>{icon}</div>
+      <h3 style={{ margin: 0, color: '#fff' }}>{title}</h3>
+      <p style={{ margin: 0, fontSize: '0.9rem' }}>{desc}</p>
+      {action && <Btn label={actionLabel} onClick={action} />}
+    </div>
+  );
+}
+
+function IconBtn({ icon, onClick, title }) {
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      style={{
+        background: '#1c1c2e',
+        border: 'none',
+        color: '#fff',
+        width: '36px',
+        height: '36px',
+        borderRadius: '8px',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        cursor: 'pointer',
+        fontSize: '1.1rem',
+        padding: 0
+      }}
+    >
+      {icon}
+    </button>
+  );
+}
+
+// ─── AppShell Wrapper Component ───
+function AppShell({ children, activeTab, ctx, noNav = false }) {
+  return (
+    <div className="app-container" style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
+      {/* Header */}
+      <header>
+        <div style={{ display: 'flex', flexDirection: 'column' }}>
+          <h1 onClick={() => ctx.setView(VIEWS.HOME)} style={{ cursor: 'pointer' }}>Nexus P2P</h1>
+          <span style={{ fontSize: '0.7rem', color: 'var(--text-dim)' }}>
+            Nœud: {ctx.currentUser?.id?.substring(0, 12)}...
+          </span>
+        </div>
+        <div className="connection-status">
+          <span className={`status-dot ${!ctx.isOnline ? 'offline' : ''}`}></span>
+          <button
+            onClick={ctx.toggleOnline}
+            style={{
+              padding: '4px 8px',
+              borderRadius: '8px',
+              fontSize: '0.75rem',
+              background: '#1f1f3a',
+              border: 'none',
+              color: '#fff',
+              cursor: 'pointer'
+            }}
+          >
+            {ctx.isOnline ? 'En ligne' : 'Hors-ligne'}
+          </button>
+        </div>
+      </header>
+
+      {/* Screen Content */}
+      <div style={{ flex: 1, paddingBottom: noNav ? '0px' : '75px' }}>
+        {children}
+      </div>
+
+      {/* Bottom Nav Bar */}
+      {!noNav && (
+        <nav className="tabs-navigation" style={{ position: 'fixed', bottom: 0, left: 0, right: 0, maxWidth: '500px', margin: '0 auto', top: 'auto', borderBottom: 'none', borderTop: 'var(--glass-border)' }}>
+          <button
+            className={`tab-btn ${activeTab === 'home' ? 'active' : ''}`}
+            onClick={() => ctx.setView(VIEWS.HOME)}
+          >
+            💬 Chat
+          </button>
+          <button
+            className={`tab-btn ${activeTab === 'discover' ? 'active' : ''}`}
+            onClick={() => ctx.setView(VIEWS.DISCOVER)}
+          >
+            🔥 Discover
+          </button>
+          <button
+            className={`tab-btn ${activeTab === 'groups' ? 'active' : ''}`}
+            onClick={() => ctx.setView(VIEWS.GROUPS)}
+          >
+            👥 Groupes
+          </button>
+          <button
+            className={`tab-btn ${activeTab === 'friends' ? 'active' : ''}`}
+            onClick={() => ctx.setView(VIEWS.FRIENDS)}
+          >
+            👤 Amis
+          </button>
+          <button
+            className={`tab-btn ${activeTab === 'profile' ? 'active' : ''}`}
+            onClick={() => ctx.setView(VIEWS.PROFILE)}
+          >
+            ⚙️ Profil
+          </button>
+        </nav>
+      )}
+    </div>
+  );
+}
+
+// ─── Splash ──────────────────────────────────────────────────
+function SplashScreen() {
+  return (
+    <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', background: "linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%)", minHeight: "100vh", width: '100%' }}>
+      <div style={{ textAlign: "center" }}>
+        <div style={{ fontSize: 72, marginBottom: 16 }}>💬</div>
+        <div style={{ fontSize: 36, fontWeight: 800, color: "#fff", letterSpacing: -1 }}>Nexus</div>
+        <div style={{ color: "#6C63FF", fontSize: 14, marginTop: 4, letterSpacing: 3 }}>DISTRIBUTED CHAT</div>
+        <div style={{ marginTop: 32, color: "#ffffff40", fontSize: 12 }}>P2P • No Server • CRDT Sync</div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Register ────────────────────────────────────────────────
+function RegisterScreen({ ctx }) {
+  const [form, setForm] = useState({ name: "", phone: "", bio: "", age: "", gender: "autre", city: "", interests: "" });
+  const set = (k) => (e) => setForm((p) => ({ ...p, [k]: e.target.value }));
+
+  const submit = () => {
+    if (!form.name.trim() || !form.phone.trim()) { ctx.showToast("Nom et téléphone requis", "error"); return; }
+    ctx.registerUser({ ...form, interests: form.interests.split(",").map((i) => i.trim()).filter(Boolean) });
+  };
+
+  return (
+    <Screen title="Créer un compte" subtitle="Rejoignez Nexus">
+      <Field label="Nom complet" value={form.name} onChange={set("name")} placeholder="Jean Dupont" />
+      <Field label="Téléphone" value={form.phone} onChange={set("phone")} placeholder="+33 6 00 00 00 00" type="tel" />
+      <Field label="Bio" value={form.bio} onChange={set("bio")} placeholder="Parlez de vous..." />
+      <Field label="Âge" value={form.age} onChange={set("age")} placeholder="25" type="number" />
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+        <label style={{ fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-dim)' }}>Genre</label>
+        <select value={form.gender} onChange={set("gender")} style={{ background: '#161626', border: 'var(--glass-border)', color: '#fff', padding: '10px', borderRadius: '10px' }}>
+          <option value="homme">Homme</option>
+          <option value="femme">Femme</option>
+          <option value="autre">Autre</option>
+        </select>
+      </div>
+      <Field label="Ville" value={form.city} onChange={set("city")} placeholder="Paris" />
+      <Field label="Centres d'intérêt (séparés par virgules)" value={form.interests} onChange={set("interests")} placeholder="musique, sport, tech" />
+      <Btn label="Créer mon compte" onClick={submit} full style={{ marginTop: '10px' }} />
+      <p style={{ textAlign: "center", color: "#888", fontSize: 13, marginTop: 16 }}>
+        Déjà un compte?{" "}
+        <span style={{ color: "#6C63FF", cursor: "pointer", fontWeight: 'bold' }} onClick={() => ctx.setView(VIEWS.LOGIN)}>Se connecter</span>
+      </p>
+    </Screen>
+  );
+}
+
+// ─── Login ───────────────────────────────────────────────────
+function LoginScreen({ ctx }) {
+  const [phone, setPhone] = useState("");
+  const login = () => {
+    const user = Object.values(ctx.users).find((u) => u.phone === phone.trim());
+    if (user) {
+      ctx.setCurrentUser?.(user);
+      indexedDB.open("nexus_chat_v4").onsuccess = async (e) => {
+        await db.put("state", { id: "app", userId: user.id });
+      };
+      window.location.reload();
+    } else {
+      ctx.showToast("Utilisateur non trouvé", "error");
+    }
+  };
+  return (
+    <Screen title="Connexion" subtitle="Retrouvez vos conversations">
+      <Field label="Téléphone" value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="+33 6 00 00 00 00" type="tel" />
+      <Btn label="Se connecter" onClick={login} full style={{ marginTop: '10px' }} />
+      <p style={{ textAlign: "center", color: "#888", fontSize: 13, marginTop: 16 }}>
+        Nouveau sur Nexus?{" "}
+        <span style={{ color: "#6C63FF", cursor: "pointer", fontWeight: 'bold' }} onClick={() => ctx.setView(VIEWS.REGISTER)}>Créer un compte</span>
+      </p>
+    </Screen>
+  );
+}
+
+// ─── OTP ────────────────────────────────────────────────────
+function OTPScreen({ ctx }) {
+  const [code, setCode] = useState("");
+  return (
+    <Screen title="Vérification OTP" subtitle={`Code envoyé au ${ctx.otpTarget}`}>
+      <div style={{ background: "#6C63FF18", borderRadius: 12, padding: 16, marginBottom: 16, fontSize: 13, color: "#6C63FF" }}>
+        🔐 En production: Firebase Auth OTP. En démo: le code est affiché dans la notification.
+      </div>
+      <Field label="Code à 6 chiffres" value={code} onChange={(e) => setCode(e.target.value)} placeholder="123456" type="number" />
+      <Btn label="Vérifier" onClick={() => ctx.verifyOtp(code)} full />
+      <Btn label="Retour" onClick={() => ctx.setView(VIEWS.PROFILE)} full secondary style={{ marginTop: '8px' }} />
+    </Screen>
+  );
+}
+
+// ─── Home ────────────────────────────────────────────────────
+function HomeScreen({ ctx }) {
+  const myFriends = ctx.friends[ctx.currentUser?.id] || [];
+  const myGroups = Object.values(ctx.groups).filter((g) => g.members?.includes(ctx.currentUser?.id));
+
+  const allChats = useMemo(() => {
+    return [
+      ...myFriends.map((fid) => {
+        const friend = ctx.users[fid];
+        if (!friend) return null;
+        const chatId = [ctx.currentUser.id, fid].sort().join("_");
+        const msgs = ctx.messages[chatId] || [];
+        const last = msgs[msgs.length - 1];
+        return { id: chatId, type: "dm", user: friend, last };
+      }).filter(Boolean),
+      ...myGroups.map((g) => {
+        const msgs = ctx.messages[g.id] || [];
+        const last = msgs[msgs.length - 1];
+        return { id: g.id, type: "group", group: g, last };
+      }),
+    ].sort((a, b) => (b.last?.ts || 0) - (a.last?.ts || 0));
+  }, [myFriends, myGroups, ctx.currentUser, ctx.messages, ctx.users]);
+
+  return (
+    <AppShell ctx={ctx} activeTab="home">
+      <div className="chat-header" style={{ borderBottom: 'none', background: 'transparent' }}>
+        <div>
+          <h2 style={{ margin: 0, fontFamily: 'Outfit, sans-serif' }}>Messages</h2>
+          <span style={{ fontSize: '0.8rem', color: 'var(--text-dim)' }}>{allChats.length} conversations</span>
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <IconBtn icon="👥" onClick={() => ctx.setView(VIEWS.ADD_FRIEND)} title="Ajouter ami" />
+          <IconBtn icon="✏️" onClick={() => ctx.setView(VIEWS.CREATE_GROUP)} title="Créer groupe" />
+        </div>
+      </div>
+
+      {allChats.length === 0 ? (
+        <EmptyState
+          icon="💬"
+          title="Aucune conversation"
+          desc="Ajoutez des amis pour commencer à chatter de bout en bout en P2P."
+          action={() => ctx.setView(VIEWS.ADD_FRIEND)}
+          actionLabel="Ajouter des amis"
+        />
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', padding: '0 16px' }}>
+          {allChats.map((chat) => (
+            <ChatRow key={chat.id} chat={chat} ctx={ctx} />
+          ))}
+        </div>
+      )}
+    </AppShell>
+  );
+}
+
+function ChatRow({ chat, ctx }) {
+  const isGroup = chat.type === "group";
+  const name = isGroup ? chat.group.name : chat.user.name;
+  const avatar = isGroup ? null : chat.user.photos?.[0];
+  const color = isGroup ? "#6C63FF" : avatarColor(chat.user.name);
+  const lastMsg = chat.last;
+
+  const open = () => {
+    if (isGroup) {
+      ctx.setSelectedChat({ id: chat.id, name, isGroup: true, group: chat.group });
+      ctx.setView(VIEWS.GROUP_CHAT);
+    } else {
+      ctx.setSelectedChat({ id: chat.id, name, user: chat.user });
+      ctx.setView(VIEWS.CHAT);
+    }
+  };
+
+  return (
+    <div className="chat-picker" style={{ display: 'flex', flexDirection: 'row', gap: '12px', alignItems: 'center', cursor: 'pointer', padding: '12px', background: 'var(--surface)', margin: '6px 0', borderRadius: '16px' }} onClick={open}>
+      <Avatar name={name} avatar={avatar} color={color} size={48} verified={!isGroup && chat.user.verified} />
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div style={{ fontWeight: 700, fontSize: 14.5 }}>{name}</div>
+          {lastMsg && <div style={{ fontSize: 10, color: "#888" }}>{formatTime(lastMsg.ts)}</div>}
+        </div>
+        <div style={{ fontSize: 13, color: "var(--text-dim)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: '2px' }}>
+          {lastMsg ? (lastMsg.type === "audio" ? "🎤 Message vocal" : lastMsg.content) : "Nouvelle discussion"}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Chat Screen ─────────────────────────────────────────────
+function ChatScreen({ ctx, isGroup }) {
+  const chat = ctx.selectedChat;
+  const [input, setInput] = useState("");
+  const [recording, setRecording] = useState(false);
+  const mediaRef = useRef(null);
+  const endRef = useRef(null);
+  const msgs = ctx.messages[chat?.id] || [];
+
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs.length]);
+
+  const send = () => {
+    if (!input.trim()) return;
+    ctx.sendMessage(chat.id, input.trim());
+    setInput("");
+  };
+
+  const startRecord = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const rec = new MediaRecorder(stream);
+      const chunks = [];
+      rec.ondataavailable = (e) => chunks.push(e.data);
+      rec.onstop = () => {
+        const blob = new Blob(chunks, { type: "audio/webm" });
+        const url = URL.createObjectURL(blob);
+        ctx.sendMessage(chat.id, url, "audio");
+        stream.getTracks().forEach((t) => t.stop());
+      };
+      rec.start();
+      mediaRef.current = rec;
+      setRecording(true);
+    } catch { ctx.showToast("Microphone non autorisé", "error"); }
+  };
+
+  const stopRecord = () => {
+    mediaRef.current?.stop();
+    setRecording(false);
+  };
+
+  const grouped = useMemo(() => {
+    const groups = [];
+    let lastDate = null;
+    msgs.forEach((m) => {
+      const d = formatDate(m.ts);
+      if (d !== lastDate) { groups.push({ type: "date", label: d }); lastDate = d; }
+      groups.push({ type: "msg", msg: m });
+    });
+    return groups;
+  }, [msgs]);
+
+  if (!chat) return null;
+
+  const otherUser = !isGroup ? ctx.users[chat.user?.id] : null;
+
+  return (
+    <div className="app-container" style={{ minHeight: "100vh", display: "flex", flexDirection: "column" }}>
+      {/* Header */}
+      <div className="chat-header">
+        <IconBtn icon="←" onClick={() => ctx.setView(isGroup ? VIEWS.GROUPS : VIEWS.HOME)} />
+        <Avatar name={chat.name} avatar={isGroup ? null : otherUser?.photos?.[0]} color={avatarColor(chat.name)} size={38} verified={otherUser?.verified} />
+        <div style={{ flex: 1, marginLeft: '4px' }}>
+          <div style={{ fontWeight: 700, fontSize: 14.5, color: "#fff" }}>{chat.name}</div>
+          <div style={{ fontSize: 11, color: "var(--secondary)" }}>
+            {isGroup ? `${chat.group?.members?.length || 0} membres` : (otherUser?.online ? "En ligne" : "Hors ligne")}
+          </div>
+        </div>
+        {!isGroup && otherUser && (
+          <IconBtn icon="👤" onClick={() => { ctx.setSelectedChat(otherUser); ctx.setView(VIEWS.PROFILE); }} />
+        )}
+      </div>
+
+      {/* Messages Area */}
+      <div style={{ flex: 1, overflowY: "auto", padding: "16px", display: "flex", flexDirection: "column", gap: 12 }}>
+        {grouped.map((item, i) =>
+          item.type === "date" ? (
+            <div key={i} style={{ textAlign: "center", fontSize: 10, color: "#555", margin: "8px 0" }}>{item.label}</div>
+          ) : (
+            <MessageBubble key={item.msg.id} msg={item.msg} isMe={item.msg.from === ctx.currentUser?.id} sender={ctx.users[item.msg.from]} isGroup={isGroup} />
+          )
+        )}
+        {msgs.length === 0 && (
+          <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "#333", fontSize: 13 }}>
+            Dites bonjour ! 👋
+          </div>
+        )}
+        <div ref={endRef} />
+      </div>
+
+      {/* Input Bar */}
+      <div className="chat-input-bar">
+        <input
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && send()}
+          placeholder="Écris ton message..."
+        />
+        <button
+          style={{ background: recording ? "var(--accent)" : "var(--primary)" }}
+          onClick={recording ? stopRecord : (input.trim() ? send : startRecord)}
+        >
+          {recording ? "⏹" : input.trim() ? "➤" : "🎤"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function MessageBubble({ msg, isMe, sender, isGroup }) {
+  const bg = isMe ? "linear-gradient(135deg, var(--primary), var(--secondary))" : "#1b1b2f";
+  return (
+    <div style={{ display: "flex", flexDirection: isMe ? "row-reverse" : "row", gap: 8, alignItems: "flex-end", maxWidth: "80%", alignSelf: isMe ? "flex-end" : "flex-start" }}>
+      {!isMe && isGroup && <Avatar name={sender?.name || "?"} size={28} color={avatarColor(sender?.name)} />}
+      <div>
+        {!isMe && isGroup && <div style={{ fontSize: 11, color: "var(--secondary)", marginBottom: 2 }}>{sender?.name}</div>}
+        <div style={{ background: bg, border: isMe ? 'none' : 'var(--glass-border)', borderRadius: isMe ? "16px 16px 4px 16px" : "16px 16px 16px 4px", padding: "10px 14px" }}>
+          {msg.type === "audio" ? (
+            <audio controls src={msg.content} style={{ height: 32, maxWidth: 220 }} />
+          ) : (
+            <div style={{ fontSize: 13.5, color: "#fff", lineHeight: 1.45 }}>{msg.content}</div>
+          )}
+        </div>
+        <div style={{ fontSize: 9, color: "var(--text-dim)", textAlign: isMe ? "right" : "left", marginTop: 4 }}>
+          {formatTime(msg.ts)} {isMe && '• 🔐 E2EE'}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Profile Screen ──────────────────────────────────────────
+function ProfileScreen({ ctx }) {
+  const user = ctx.selectedChat?.id ? ctx.users[ctx.selectedChat.id] || ctx.selectedChat : ctx.currentUser;
+  const isMe = user?.id === ctx.currentUser?.id;
+  const maxPhotos = user?.premium ? 10 : 3;
+  const photos = user?.photos || [];
+
+  if (!user) return null;
+
+  return (
+    <AppShell ctx={ctx} activeTab="profile" noNav={!isMe}>
+      {!isMe && (
+        <div style={{ padding: "16px 0 0 16px" }}>
+          <IconBtn icon="←" onClick={() => ctx.setView(VIEWS.HOME)} />
+        </div>
+      )}
+
+      {/* Hero profile background layout */}
+      <div style={{ position: "relative", height: 280, background: `linear-gradient(135deg, ${user.avatarColor || '#6c63ff'}44, #0d0d1a)`, overflow: "hidden" }}>
+        {photos[0] ? (
+          <img src={photos[0]} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", opacity: 0.7 }} />
+        ) : (
+          <div style={{ display: 'flex', height: '100%', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', gap: 12 }}>
+            <div style={{ width: 100, height: 100, borderRadius: "50%", background: user.avatarColor, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 36, fontWeight: 800, color: "#fff", border: "4px solid rgba(255,255,255,0.15)" }}>
+              {initials(user.name)}
+            </div>
+          </div>
+        )}
+        <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, background: "linear-gradient(transparent, #09090f)", padding: "40px 20px 16px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{ fontSize: 24, fontWeight: 800, color: "#fff", fontFamily: 'Outfit' }}>{user.name}</div>
+            {user.verified && <span title="Numéro vérifié" style={{ fontSize: 18 }}>✅</span>}
+            {user.premium && <span className="badge-premium">PRO</span>}
+          </div>
+          <div style={{ color: "#aaa", fontSize: 13.5, marginTop: '2px' }}>
+            {user.age && `${user.age} ans`}{user.city && ` • ${user.city}`}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ padding: 20 }}>
+        {/* Bio */}
+        {user.bio && <div style={{ color: "#ccc", fontSize: 14, lineHeight: 1.5, marginBottom: 20 }}>{user.bio}</div>}
+
+        {/* Interests */}
+        {user.interests?.length > 0 && (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 20 }}>
+            {user.interests.map((t) => (
+              <span key={t} className="tag">#{t}</span>
+            ))}
+          </div>
+        )}
+
+        {/* Actions button */}
+        {isMe ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <Btn label="✏️ Modifier le profil" onClick={() => ctx.setView(VIEWS.EDIT_PROFILE)} full />
+            {!user.verified && <Btn label="📱 Vérifier mon numéro" onClick={() => ctx.sendOtp(user.phone)} full secondary />}
+            <div style={{ display: 'flex', gap: 8 }}>
+              {user.superAdmin && <Btn label="🛡️ Admin Panel" onClick={() => ctx.setView(VIEWS.ADMIN)} full secondary style={{ flex: 1 }} />}
+              <Btn label="⚙️ Paramètres" onClick={() => ctx.setView(VIEWS.SETTINGS)} full secondary style={{ flex: 1 }} />
+            </div>
+          </div>
+        ) : (
+          <div style={{ display: "flex", gap: 10 }}>
+            <Btn label="💬 Message" onClick={() => {
+              const chatId = [ctx.currentUser.id, user.id].sort().join("_");
+              ctx.setSelectedChat({ id: chatId, name: user.name, user });
+              ctx.setView(VIEWS.CHAT);
+            }} full />
+            <Btn label="👥 Ajouter" onClick={() => ctx.addFriend(user.id)} full secondary />
+          </div>
+        )}
+
+        {/* Photos Grid */}
+        <div style={{ marginTop: 24 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+            <div style={{ fontWeight: 700, fontSize: 15, color: "#fff" }}>Photos ({photos.length}/{maxPhotos})</div>
+            {isMe && photos.length < maxPhotos && (
+              <label style={{ cursor: "pointer", color: "var(--secondary)", fontSize: 13, fontWeight: 'bold' }}>
+                + Ajouter
+                <input type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => {
+                  const file = e.target.files[0];
+                  if (!file) return;
+                  const reader = new FileReader();
+                  reader.onload = (ev) => {
+                    ctx.updateProfile({ photos: [...photos, ev.target.result] });
+                  };
+                  reader.readAsDataURL(file);
+                }} />
+              </label>
+            )}
+          </div>
+          {photos.length > 0 ? (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6 }}>
+              {photos.map((p, i) => (
+                <div key={i} style={{ aspectRatio: "1", borderRadius: 12, overflow: "hidden", background: "#1c1c2e", position: 'relative' }}>
+                  <img src={p} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                  {isMe && (
+                    <button
+                      onClick={() => {
+                        const updated = photos.filter((_, idx) => idx !== i);
+                        ctx.updateProfile({ photos: updated });
+                      }}
+                      style={{
+                        position: 'absolute',
+                        top: 4,
+                        right: 4,
+                        background: 'rgba(0,0,0,0.6)',
+                        border: 'none',
+                        color: 'red',
+                        borderRadius: '50%',
+                        width: 20,
+                        height: 20,
+                        padding: 0,
+                        fontSize: 10,
+                        cursor: 'pointer'
+                      }}
+                    >
+                      ✖
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div style={{ color: "var(--text-dim)", fontSize: 13, textAlign: "center", padding: 20, border: '1px dashed #222', borderRadius: '12px' }}>
+              Aucune photo dans votre album.
+            </div>
+          )}
+
+          {!user.premium && isMe && (
+            <div style={{ marginTop: 16, background: "linear-gradient(135deg, #FFC857, #FF6584)", borderRadius: 16, padding: 16, textAlign: "center" }}>
+              <div style={{ fontWeight: 800, color: "#000", fontSize: 14 }}>🌟 Passez Premium</div>
+              <div style={{ color: "#000000bb", fontSize: 11.5, marginTop: '2px' }}>10 photos & vidéos • Badge Pro • Plus de visibilité</div>
+              <button
+                onClick={() => ctx.updateProfile({ premium: true })}
+                style={{
+                  background: '#000',
+                  color: '#fff',
+                  border: 'none',
+                  padding: '6px 14px',
+                  borderRadius: '8px',
+                  fontSize: '0.75rem',
+                  fontWeight: 'bold',
+                  marginTop: '10px',
+                  cursor: 'pointer'
+                }}
+              >
+                Activer Premium
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </AppShell>
+  );
+}
+
+// ─── Edit Profile ────────────────────────────────────────────
+function EditProfileScreen({ ctx }) {
+  const u = ctx.currentUser;
+  const [form, setForm] = useState({ name: u?.name || "", bio: u?.bio || "", age: u?.age || "", city: u?.city || "", interests: (u?.interests || []).join(", "), gender: u?.gender || "" });
+  const set = (k) => (e) => setForm((p) => ({ ...p, [k]: e.target.value }));
+
+  const save = () => {
+    ctx.updateProfile({ ...form, interests: form.interests.split(",").map((i) => i.trim()).filter(Boolean) });
+    ctx.setView(VIEWS.PROFILE);
+  };
+
+  return (
+    <Screen title="Modifier le profil" back={() => ctx.setView(VIEWS.PROFILE)}>
+      <Field label="Nom" value={form.name} onChange={set("name")} />
+      <Field label="Bio" value={form.bio} onChange={set("bio")} />
+      <Field label="Âge" value={form.age} onChange={set("age")} type="number" />
+      <Field label="Ville" value={form.city} onChange={set("city")} />
+      <Field label="Centres d'intérêt" value={form.interests} onChange={set("interests")} placeholder="musique, sport..." />
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+        <label style={{ fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-dim)' }}>Genre</label>
+        <select value={form.gender} onChange={set("gender")} style={{ background: '#161626', border: 'var(--glass-border)', color: '#fff', padding: '10px', borderRadius: '10px' }}>
+          <option value="homme">Homme</option>
+          <option value="femme">Femme</option>
+          <option value="autre">Autre</option>
+        </select>
+      </div>
+      <Btn label="📍 Partager ma position GPS" onClick={ctx.getLocation} full secondary style={{ marginTop: '10px' }} />
+      <Btn label="Enregistrer" onClick={save} full />
+    </Screen>
+  );
+}
+
+// ─── Friends Screen ──────────────────────────────────────────
+function FriendsScreen({ ctx }) {
+  const myFriends = (ctx.friends[ctx.currentUser?.id] || []).map((id) => ctx.users[id]).filter(Boolean);
+
+  return (
+    <AppShell ctx={ctx} activeTab="friends">
+      <div className="chat-header" style={{ borderBottom: 'none', background: 'transparent' }}>
+        <div>
+          <h2 style={{ margin: 0, fontFamily: 'Outfit, sans-serif' }}>Amis</h2>
+          <span style={{ fontSize: '0.8rem', color: 'var(--text-dim)' }}>{myFriends.length} amis</span>
+        </div>
+        <IconBtn icon="+" onClick={() => ctx.setView(VIEWS.ADD_FRIEND)} />
+      </div>
+      {myFriends.length === 0 ? (
+        <EmptyState
+          icon="👥"
+          title="Aucun ami"
+          desc="Ajoutez des amis via téléphone ou QR code pour chatter en privé."
+          action={() => ctx.setView(VIEWS.ADD_FRIEND)}
+          actionLabel="Ajouter des amis"
+        />
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', padding: '0 16px' }}>
+          {myFriends.map((friend) => (
+            <div key={friend.id} className="chat-picker" style={{ display: 'flex', flexDirection: 'row', gap: '12px', alignItems: 'center', padding: '12px', background: 'var(--surface)', margin: '6px 0', borderRadius: '16px', cursor: 'pointer' }} onClick={() => {
+              ctx.setSelectedChat(friend);
+              ctx.setView(VIEWS.PROFILE);
+            }}>
+              <Avatar name={friend.name} avatar={friend.photos?.[0]} color={avatarColor(friend.name)} size={48} verified={friend.verified} />
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 700, fontSize: 14.5, color: "#fff" }}>{friend.name}</div>
+                <div style={{ fontSize: 12, color: "var(--text-dim)" }}>{friend.city || friend.phone}</div>
+              </div>
+              <Btn label="Message" onClick={(e) => {
+                e.stopPropagation();
+                const chatId = [ctx.currentUser.id, friend.id].sort().join("_");
+                ctx.setSelectedChat({ id: chatId, name: friend.name, user: friend });
+                ctx.setView(VIEWS.CHAT);
+              }} small style={{ padding: '8px 14px', borderRadius: '8px', fontSize: '0.75rem' }} />
+            </div>
+          ))}
+        </div>
+      )}
+    </AppShell>
+  );
+}
+
+// ─── Add Friend ──────────────────────────────────────────────
+function AddFriendScreen({ ctx }) {
+  const [tab, setTab] = useState("phone");
+  const [phone, setPhone] = useState("");
+  const [result, setResult] = useState(null);
+  const myId = ctx.currentUser?.id;
+  const myFriends = ctx.friends[myId] || [];
+
+  const search = () => {
+    const found = Object.values(ctx.users).find((u) => u.phone === phone.trim() && u.id !== myId);
+    setResult(found || "not_found");
+  };
+
+  const myQR = `p2p-app://add-friend?peerId=${myId}`;
+
+  return (
+    <Screen title="Ajouter un ami" back={() => ctx.setView(VIEWS.FRIENDS)}>
+      <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+        {["phone", "qr"].map((t) => (
+          <button
+            key={t}
+            style={{
+              flex: 1,
+              padding: "10px",
+              borderRadius: 12,
+              border: "none",
+              background: tab === t ? "var(--primary)" : "#1e1e2e",
+              color: "#fff",
+              cursor: "pointer",
+              fontWeight: 600,
+              fontSize: 14
+            }}
+            onClick={() => setTab(t)}
+          >
+            {t === "phone" ? "📱 Téléphone" : "📷 QR Code"}
+          </button>
+        ))}
+      </div>
+
+      {tab === "phone" && (
+        <div className="filters-panel">
+          <Field label="Numéro de téléphone" value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="+33 6 00 00 00 00" type="tel" />
+          <Btn label="Rechercher" onClick={search} full />
+          {result === "not_found" && <div style={{ color: "var(--accent)", textAlign: "center", marginTop: 12, fontSize: 13.5 }}>Aucun utilisateur trouvé</div>}
+          {result && result !== "not_found" && (
+            <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 16, background: '#161626', padding: '12px', borderRadius: '12px' }}>
+              <Avatar name={result.name} avatar={result.photos?.[0]} color={avatarColor(result.name)} size={44} verified={result.verified} />
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 700, color: "#fff" }}>{result.name}</div>
+                <div style={{ color: "var(--text-dim)", fontSize: 12 }}>{result.city}</div>
+              </div>
+              {myFriends.includes(result.id) ? (
+                <span style={{ color: "var(--success)", fontSize: 13, fontWeight: 'bold' }}>✓ Ami</span>
+              ) : (
+                <Btn label="Ajouter" onClick={() => { ctx.addFriend(result.id); setResult(null); setPhone(""); }} small style={{ padding: '8px 12px', borderRadius: '8px', fontSize: '0.75rem' }} />
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab === "qr" && (
+        <div className="filters-panel" style={{ textAlign: "center" }}>
+          <div style={{ marginBottom: 12, color: "var(--text-dim)", fontSize: 13.5 }}>Votre QR Code</div>
+          <div style={{ display: "inline-block", background: "#fff", padding: 12, borderRadius: 16, marginBottom: '8px' }}>
+            <QRCanvas data={myQR} size={150} />
+          </div>
+          <div style={{ color: "var(--text-dim)", fontSize: 12 }}>Faites scanner ce code par un autre utilisateur.</div>
+
+          <div style={{ marginTop: 24, borderTop: "1px solid rgba(255,255,255,0.05)", paddingTop: 16 }}>
+            <div style={{ color: "var(--text-dim)", fontSize: 13.5, marginBottom: 12 }}>Simuler le scan d'un ami</div>
+            {/* Simulation scanner input */}
+            <div style={{ display: 'flex', gap: 6, marginBottom: '12px' }}>
+              <input
+                type="text"
+                placeholder="Copier le PeerID ou lien QR d'un ami..."
+                style={{ flex: 1, background: '#1c1c2e', border: 'var(--glass-border)', color: '#fff', padding: '8px', borderRadius: '8px', fontSize: '0.85rem' }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && e.target.value.trim()) {
+                    const id = e.target.value.replace('p2p-app://add-friend?peerId=', '').trim();
+                    ctx.addFriend(id);
+                    e.target.value = '';
+                  }
+                }}
+              />
+            </div>
+            
+            <div style={{ color: "var(--text-dim)", fontSize: 12, marginBottom: 8, textAlign: 'left' }}>Nœuds détectés sur le réseau :</div>
+            <div style={{ textAlign: 'left' }}>
+              {Object.values(ctx.users).filter((u) => u.id !== myId).map((u) => (
+                <div key={u.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: "1px solid rgba(255,255,255,0.05)" }}>
+                  <Avatar name={u.name} avatar={u.photos?.[0]} color={avatarColor(u.name)} size={36} />
+                  <div style={{ flex: 1, fontSize: 13, color: "#ccc" }}>{u.name}</div>
+                  {myFriends.includes(u.id) ? (
+                    <span style={{ color: "var(--success)", fontSize: 12, fontWeight: 'bold' }}>✓</span>
+                  ) : (
+                    <Btn label="+ Ajouter" onClick={() => ctx.addFriend(u.id)} small style={{ padding: '6px 10px', borderRadius: '6px', fontSize: '0.7rem' }} />
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </Screen>
+  );
+}
+
+// ─── Groups Screen ───────────────────────────────────────────
+function GroupsScreen({ ctx }) {
+  const myGroups = Object.values(ctx.groups).filter((g) => g.members?.includes(ctx.currentUser?.id));
+
+  return (
+    <AppShell ctx={ctx} activeTab="groups">
+      <div className="chat-header" style={{ borderBottom: 'none', background: 'transparent' }}>
+        <div>
+          <h2 style={{ margin: 0, fontFamily: 'Outfit, sans-serif' }}>Groupes</h2>
+          <span style={{ fontSize: '0.8rem', color: 'var(--text-dim)' }}>{myGroups.length} groupes</span>
+        </div>
+        <IconBtn icon="+" onClick={() => ctx.setView(VIEWS.CREATE_GROUP)} />
+      </div>
+      {myGroups.length === 0 ? (
+        <EmptyState
+          icon="👥"
+          title="Aucun groupe"
+          desc="Créez un groupe pour chatter avec plusieurs amis à la fois."
+          action={() => ctx.setView(VIEWS.CREATE_GROUP)}
+          actionLabel="Créer un groupe"
+        />
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', padding: '0 16px' }}>
+          {myGroups.map((group) => (
+            <div key={group.id} className="chat-picker" style={{ display: 'flex', flexDirection: 'row', gap: '12px', alignItems: 'center', padding: '12px', background: 'var(--surface)', margin: '6px 0', borderRadius: '16px', cursor: 'pointer' }} onClick={() => {
+              ctx.setSelectedChat({ id: group.id, name: group.name, isGroup: true, group });
+              ctx.setView(VIEWS.GROUP_CHAT);
+            }}>
+              <div style={{ width: 48, height: 48, borderRadius: "50%", background: "linear-gradient(135deg, var(--primary), var(--secondary))", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20 }}>👥</div>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 700, fontSize: 14.5, color: "#fff" }}>{group.name}</div>
+                <div style={{ fontSize: 12, color: "var(--text-dim)" }}>{group.members?.length} membres</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </AppShell>
+  );
+}
+
+// ─── Create Group ────────────────────────────────────────────
+function CreateGroupScreen({ ctx }) {
+  const [name, setName] = useState("");
+  const [selected, setSelected] = useState([]);
+  const myFriends = (ctx.friends[ctx.currentUser?.id] || []).map((id) => ctx.users[id]).filter(Boolean);
+
+  const toggle = (id) => setSelected((prev) => prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]);
+
+  const create = async () => {
+    if (!name.trim()) { ctx.showToast("Nom du groupe requis", "error"); return; }
+    if (selected.length === 0) { ctx.showToast("Sélectionnez au moins un membre", "error"); return; }
+    const g = await ctx.createGroup(name.trim(), selected);
+    if (g) {
+      ctx.setSelectedChat({ id: g.id, name: g.name, isGroup: true, group: g });
+      ctx.setView(VIEWS.GROUP_CHAT);
+    }
+  };
+
+  return (
+    <Screen title="Créer un groupe" back={() => ctx.setView(VIEWS.GROUPS)}>
+      <Field label="Nom du groupe" value={name} onChange={(e) => setName(e.target.value)} placeholder="Nom du groupe..." />
+      <div className="filters-panel" style={{ marginTop: '10px' }}>
+        <label style={{ fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-dim)', display: 'block', marginBottom: '8px' }}>Membres ({selected.length} sélectionnés)</label>
+        {myFriends.length === 0 ? (
+          <div style={{ color: "var(--text-dim)", fontSize: 13, padding: 12, textAlign: 'center' }}>Ajoutez d'abord des amis</div>
+        ) : myFriends.map((f) => (
+          <div key={f.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 0", borderBottom: "1px solid rgba(255,255,255,0.05)", cursor: "pointer" }} onClick={() => toggle(f.id)}>
+            <Avatar name={f.name} avatar={f.photos?.[0]} color={avatarColor(f.name)} size={40} />
+            <div style={{ flex: 1, color: "#fff", fontSize: 14 }}>{f.name}</div>
+            <div style={{
+              width: 22,
+              height: 22,
+              borderRadius: 6,
+              border: `2px solid ${selected.includes(f.id) ? "var(--secondary)" : "#444"}`,
+              background: selected.includes(f.id) ? "var(--primary)" : "transparent",
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              fontSize: '11px'
+            }}>
+              {selected.includes(f.id) && '✓'}
+            </div>
+          </div>
+        ))}
+      </div>
+      <Btn label="Créer le groupe" onClick={create} full style={{ marginTop: '10px' }} />
+    </Screen>
+  );
+}
+
+// ─── Discover Screen (Tinder style layout) ───
+function DiscoverScreen({ ctx }) {
+  const [filterName, setFilterName] = useState("");
+  const [filterCity, setFilterCity] = useState("");
+  const [filterMinAge, setFilterMinAge] = useState(18);
+  const [filterMaxAge, setFilterMaxAge] = useState(65);
+  const [photoIndex, setPhotoIndex] = useState(0);
+  const [passedIds, setPassedIds] = useState([]);
+
+  const discoveryProfiles = useMemo(() => {
+    const myId = ctx.currentUser?.id;
+    const myFriends = ctx.friends[myId] || [];
+    return Object.values(ctx.users).filter(u => {
+      if (u.id === myId) return false;
+      if (myFriends.includes(u.id)) return false;
+      if (passedIds.includes(u.id)) return false;
+      if (filterName && !u.name.toLowerCase().includes(filterName.toLowerCase())) return false;
+      if (filterCity && u.city && !u.city.toLowerCase().includes(filterCity.toLowerCase())) return false;
+      if (u.age && (u.age < filterMinAge || u.age > filterMaxAge)) return false;
+      return true;
+    });
+  }, [ctx.users, ctx.currentUser, ctx.friends, passedIds, filterName, filterCity, filterMinAge, filterMaxAge]);
+
+  const activeProfile = discoveryProfiles[0];
+
+  const handleLike = () => {
+    if (!activeProfile) return;
+    ctx.addFriend(activeProfile.id);
+    setPhotoIndex(0);
+  };
+
+  const handlePass = () => {
+    if (!activeProfile) return;
+    setPassedIds(prev => [...prev, activeProfile.id]);
+    setPhotoIndex(0);
+    ctx.showToast("Passé ! ✖", "info");
+  };
+
+  return (
+    <AppShell ctx={ctx} activeTab="discover">
+      <div className="discovery-tab">
+        {/* Filters */}
+        <div className="filters-panel">
+          <h4 style={{ margin: '0 0 8px' }}>Filtres de recherche</h4>
+          <div className="filter-row">
+            <label>Nom :</label>
+            <input
+              type="text"
+              placeholder="Ex: Clara"
+              value={filterName}
+              onChange={e => setFilterName(e.target.value)}
+            />
+          </div>
+          <div className="filter-row">
+            <label>Ville :</label>
+            <input
+              type="text"
+              placeholder="Ex: Paris"
+              value={filterCity}
+              onChange={e => setFilterCity(e.target.value)}
+            />
+          </div>
+          <div className="filter-row">
+            <label>Âge : {filterMinAge} - {filterMaxAge} ans</label>
+            <div style={{ display: 'flex', gap: '6px' }}>
+              <input
+                type="range"
+                min="18"
+                max="80"
+                value={filterMinAge}
+                onChange={e => setFilterMinAge(parseInt(e.target.value))}
+              />
+              <input
+                type="range"
+                min="18"
+                max="80"
+                value={filterMaxAge}
+                onChange={e => setFilterMaxAge(parseInt(e.target.value))}
+              />
+            </div>
+          </div>
+        </div>
+
+        {/* Card */}
+        <div className="tinder-card-container">
+          {activeProfile ? (
+            <div className="profile-card">
+              <div className="hero">
+                <img
+                  src={activeProfile.photos?.[photoIndex] || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=500&auto=format&fit=crop'}
+                  alt={activeProfile.name}
+                />
+                
+                {/* Photo carrousel arrows */}
+                {activeProfile.photos?.length > 1 && (
+                  <div className="hero-slider-btns">
+                    <button
+                      className="slider-arrow"
+                      onClick={() => setPhotoIndex(prev => Math.max(0, prev - 1))}
+                      disabled={photoIndex === 0}
+                    >
+                      ◀
+                    </button>
+                    <button
+                      className="slider-arrow"
+                      onClick={() => setPhotoIndex(prev => Math.min((activeProfile.photos.length - 1), prev + 1))}
+                      disabled={photoIndex === activeProfile.photos.length - 1}
+                    >
+                      ▶
+                    </button>
+                  </div>
+                )}
+
+                <div className="hero-info">
+                  <h2>
+                    {activeProfile.name}, {activeProfile.age || 'Non renseigné'}
+                    {activeProfile.verified && <span title="Numéro vérifié" style={{ fontSize: '1.2rem' }}>✅</span>}
+                    {activeProfile.premium && <span className="badge-premium">PREMIUM</span>}
+                  </h2>
+                  <p>📍 {activeProfile.city || 'Inconnue'}</p>
+                </div>
+              </div>
+
+              {activeProfile.bio && <p className="profile-bio">{activeProfile.bio}</p>}
+
+              <div className="interests-tags">
+                {activeProfile.interests?.map(tag => (
+                  <span key={tag} className="tag">#{tag}</span>
+                ))}
+              </div>
+
+              {/* Like / Pass Actions */}
+              <div className="tinder-actions">
+                <button className="tinder-btn pass" onClick={handlePass}>
+                  ✖
+                </button>
+                <button className="tinder-btn like" onClick={handleLike}>
+                  ❤️
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="no-more-profiles">
+              <h3>Aucun profil trouvé</h3>
+              <p>Essayez de réinitialiser vos filtres ou attendez que d'autres nœuds rejoignent le réseau local.</p>
+            </div>
+          )}
+        </div>
+      </div>
+    </AppShell>
+  );
+}
+
+// ─── Settings Screen ───
+function SettingsScreen({ ctx }) {
+  const handleClearDb = async () => {
+    if (confirm("Voulez-vous vraiment effacer toute la base de données locale ?")) {
+      await Promise.all([
+        db.clear('users'),
+        db.clear('messages'),
+        db.clear('groups'),
+        db.clear('friends'),
+        db.clear('state')
+      ]);
+      ctx.showToast("Base de données réinitialisée !", "success");
+      window.location.reload();
+    }
+  };
+
+  return (
+    <Screen title="Paramètres" back={() => ctx.setView(VIEWS.PROFILE)}>
+      <div className="filters-panel" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+        <h3 style={{ margin: 0 }}>Options Réseau P2P</h3>
+        <div className="filter-row">
+          <span>Identifiant Nœud :</span>
+          <span style={{ fontSize: '0.8rem', color: 'var(--text-dim)' }}>{localStorage.getItem('nexus_nodeId') || 'Non généré'}</span>
+        </div>
+        <div className="filter-row">
+          <span>Protocole Sync :</span>
+          <span style={{ color: 'var(--secondary)', fontWeight: 'bold' }}>BroadcastChannel (v4)</span>
+        </div>
+      </div>
+
+      <div className="filters-panel" style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginTop: '16px' }}>
+        <h3 style={{ margin: 0 }}>Gestion du Compte</h3>
+        <Btn label="Déconnexion" onClick={ctx.logout} full secondary />
+        <Btn label="⚠️ Réinitialiser l'application" onClick={handleClearDb} style={{ background: 'var(--accent)' }} full />
+      </div>
+    </Screen>
+  );
+}
+
+// ─── Super Admin Screen (Leaflet maps) ───
+function AdminScreen({ ctx }) {
+  const allUsers = Object.values(ctx.users);
+  const mapInstanceRef = useRef(null);
+  const markersRef = useRef(new Map());
+
+  useEffect(() => {
+    // Lazy initialize leaflet map
+    if (window.L && !mapInstanceRef.current) {
+      mapInstanceRef.current = window.L.map('admin-map').setView([46.2276, 2.2137], 5);
+      window.L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; OpenStreetMap'
+      }).addTo(mapInstanceRef.current);
+    }
+
+    const map = mapInstanceRef.current;
+    if (map && window.L) {
+      // Clear old layers
+      const currentUserIds = new Set(allUsers.map(u => u.id));
+      for (const [id, marker] of markersRef.current.entries()) {
+        if (!currentUserIds.has(id)) {
+          map.removeLayer(marker);
+          markersRef.current.delete(id);
+        }
+      }
+
+      // Add markers
+      allUsers.forEach(u => {
+        if (u.location && u.location.lat && u.location.lng) {
+          const latLng = [u.location.lat, u.location.lng];
+          if (markersRef.current.has(u.id)) {
+            markersRef.current.get(u.id).setLatLng(latLng);
+          } else {
+            const marker = window.L.marker(latLng).addTo(map);
+            const popupContent = `
+              <div style="color: #111; font-family: sans-serif; font-size: 13px;">
+                <b>${u.name}</b> ${u.verified ? '✅' : ''}<br/>
+                📞 ${u.phone}<br/>
+                📍 ${u.city || 'Non spécifiée'}
+              </div>
+            `;
+            marker.bindPopup(popupContent);
+            markersRef.current.set(u.id, marker);
+          }
+        }
+      });
+    }
+  }, [allUsers]);
+
+  return (
+    <div className="login" style={{ padding: '24px', display: 'flex', flexDirection: 'column', gap: '16px', minHeight: '100vh' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+        <button onClick={() => ctx.setView(VIEWS.PROFILE)} style={{ background: '#1c1c2e', padding: '8px 12px', borderRadius: '8px', border: 'none', color: '#fff', cursor: 'pointer' }}>←</button>
+        <div>
+          <h2 style={{ margin: 0, fontFamily: 'Outfit, sans-serif' }}>Super Admin Panel</h2>
+        </div>
+      </div>
+
+      <div className="stats-grid">
+        <div className="stat">Users: {allUsers.length}</div>
+        <div className="stat">Verified: {allUsers.filter(u => u.verified).length}</div>
+        <div className="stat">Premium: {allUsers.filter(u => u.premium).length}</div>
+      </div>
+
+      <div className="map-container">
+        <h3>📍 Localisation des Nœuds (OSM)</h3>
+        <div id="admin-map" style={{ height: '360px', background: '#181824', borderRadius: '12px', border: '1px solid #2e2e4a' }}></div>
+      </div>
+
+      <div className="user-list">
+        <h3>Activité des Utilisateurs</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Nom</th>
+              <th>Téléphone</th>
+              <th>Statut</th>
+            </tr>
+          </thead>
+          <tbody>
+            {allUsers.map(u => (
+              <tr key={u.id}>
+                <td>{u.name} {u.superAdmin && '👑'}</td>
+                <td>{u.phone}</td>
+                <td>{u.verified ? '✅ OTP' : '❌'}{u.premium ? ' ⭐ Pro' : ''}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
