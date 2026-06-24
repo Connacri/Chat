@@ -1,11 +1,15 @@
 name: Release Nexus
 
 on:
+  push:
+    branches:
+      - main
+      - master
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag à publier (ex: v1.2.3)'
-        required: true
+        description: 'Version tag à publier (ex: v1.2.3, laisser vide pour incrémentation automatique)'
+        required: false
         type: string
       prerelease:
         description: 'Marquer comme pre-release ?'
@@ -16,13 +20,15 @@ on:
 jobs:
   release:
     runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, 'skip ci') && !contains(github.event.head_commit.message, 'chore: bump version')"
     permissions:
-      contents: write # Requis pour créer des GitHub Releases et des tags
+      contents: write # Requis pour créer des GitHub Releases, des tags et pousser les commits
 
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -33,12 +39,65 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # ─── Calculer la version ─────────────────────────────────────────────
+      - name: Calculate and set version
+        id: version_bump
+        run: |
+          node -e '
+            const fs = require("fs");
+            const { execSync } = require("child_process");
+            
+            let newVersion = "${{ inputs.version }}".trim();
+            
+            if (!newVersion) {
+              let latestTag = "";
+              try {
+                execSync("git fetch --tags");
+                latestTag = execSync("git describe --tags --abbrev=0").toString().trim();
+              } catch (e) {
+                try {
+                  latestTag = "v" + require("./package.json").version;
+                } catch (err) {
+                  latestTag = "v1.0.0";
+                }
+              }
+              console.log("Latest tag found: " + latestTag);
+              
+              const match = latestTag.match(/v?(\d+)\.(\d+)\.(\d+)/);
+              let major = 1, minor = 0, patch = 0;
+              if (match) {
+                major = parseInt(match[1], 10);
+                minor = parseInt(match[2], 10);
+                patch = parseInt(match[3], 10) + 1;
+              }
+              newVersion = `${major}.${minor}.${patch}`;
+            } else {
+              if (newVersion.startsWith("v")) {
+                newVersion = newVersion.substring(1);
+              }
+            }
+            
+            const newTag = `v${newVersion}`;
+            console.log("Using version: " + newVersion);
+            console.log("Using tag: " + newTag);
+            
+            if (fs.existsSync("package.json")) {
+              const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+              pkg.version = newVersion;
+              fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n", "utf8");
+              console.log("Updated package.json version to " + newVersion);
+            }
+            
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${newVersion}\n`);
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `tag=${newTag}\n`);
+          '
+
       # ─── Build Website ───────────────────────────────────────────────────
       - name: Build website
         run: npm run build
 
       - name: Package website as ZIP
-        run: zip -r nexus-web-${{ inputs.version }}.zip dist/
+        run: zip -r nexus-web-${{ steps.version_bump.outputs.version }}.zip dist/
 
       # ─── Décoder la Keystore ─────────────────────────────────────────────
       - name: Decode keystore
@@ -60,6 +119,35 @@ jobs:
       - name: Sync Capacitor
         run: npx cap sync android
 
+      # ─── Mettre à jour la version Android ───────────────────────────────
+      - name: Update Android version in build.gradle
+        run: |
+          node -e '
+            const fs = require("fs");
+            const file = "android/app/build.gradle";
+            if (fs.existsSync(file)) {
+              let content = fs.readFileSync(file, "utf8");
+              
+              const version = "${{ steps.version_bump.outputs.version }}";
+              const parts = version.split(".");
+              const major = parseInt(parts[0], 10) || 1;
+              const minor = parseInt(parts[1], 10) || 0;
+              const patch = parseInt(parts[2], 10) || 0;
+              const versionCode = (major * 10000) + (minor * 100) + patch;
+              
+              // Replace versionCode
+              content = content.replace(/versionCode\s+\d+/, `versionCode ${versionCode}`);
+              // Replace versionName
+              content = content.replace(/versionName\s+"[^"]*"/, `versionName "${version}"`);
+              
+              fs.writeFileSync(file, content, "utf8");
+              console.log(`✅ Android build.gradle updated with versionCode ${versionCode} and versionName ${version}`);
+            } else {
+              console.log("❌ android/app/build.gradle not found!");
+              process.exit(1);
+            }
+          '
+
       - name: Make Gradlew executable
         run: chmod +x android/gradlew
 
@@ -75,7 +163,7 @@ jobs:
 
           echo "✅ Build-tools version: $BUILD_TOOLS"
 
-          # Trouver l'APK non-signé (gère les noms différents selon la config gradle)
+          # Trouver l'APK non-signé
           APK_UNSIGNED=$(find android/app/build/outputs/apk/release -name "*.apk" | head -1)
           echo "📦 APK trouvé: $APK_UNSIGNED"
 
@@ -88,7 +176,7 @@ jobs:
             --ks-pass pass:"${{ secrets.KEY_STORE_PASSWORD }}" \
             --ks-key-alias "${{ secrets.KEY_ALIAS }}" \
             --key-pass pass:"${{ secrets.KEY_PASSWORD }}" \
-            --out "nexus-chat-${{ inputs.version }}.apk" \
+            --out "nexus-chat-${{ steps.version_bump.outputs.version }}.apk" \
             app-release-aligned.apk
 
           echo "✅ APK signé avec succès"
@@ -97,30 +185,40 @@ jobs:
         run: |
           BUILD_TOOLS=$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)
           "$ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS/apksigner" verify \
-            --verbose "nexus-chat-${{ inputs.version }}.apk"
+            --verbose "nexus-chat-${{ steps.version_bump.outputs.version }}.apk"
+
+      # ─── Pousser les changements de version et le Tag ────────────────────
+      - name: Commit and push version bump & tag
+        run: |
+          git config --global user.email "action@github.com"
+          git config --global user.name "GitHub Action"
+          git add package.json
+          git commit -m "chore: bump version to ${{ steps.version_bump.outputs.version }} [skip ci]" || echo "No changes to commit"
+          git tag ${{ steps.version_bump.outputs.tag }}
+          git push origin HEAD:${{ github.ref_name }} --tags
 
       # ─── Créer la GitHub Release ─────────────────────────────────────────
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.version }}
-          name: "🚀 Nexus Chat ${{ inputs.version }}"
+          tag_name: ${{ steps.version_bump.outputs.tag }}
+          name: "🚀 Nexus Chat ${{ steps.version_bump.outputs.tag }}"
           body: |
-            ## 🌐 Nexus Chat ${{ inputs.version }}
+            ## 🌐 Nexus Chat ${{ steps.version_bump.outputs.tag }}
 
             ### 📦 Téléchargements
-            - **`nexus-web-${{ inputs.version }}.zip`** — Site web (déploie dans n'importe quel hébergeur statique)
-            - **`nexus-chat-${{ inputs.version }}.apk`** — Application Android **signée** (active "Sources inconnues" avant d'installer)
+            - **`nexus-web-${{ steps.version_bump.outputs.version }}.zip`** — Site web (déploie dans n'importe quel hébergeur statique)
+            - **`nexus-chat-${{ steps.version_bump.outputs.version }}.apk`** — Application Android **signée** (active "Sources inconnues" avant d'installer)
 
             ### ✅ Changements
             Voir les commits depuis la dernière release.
 
             ---
-            *Release créée manuellement via GitHub Actions*
+            *Release générée automatiquement par GitHub Actions*
           files: |
-            nexus-web-${{ inputs.version }}.zip
-            nexus-chat-${{ inputs.version }}.apk
+            nexus-web-${{ steps.version_bump.outputs.version }}.zip
+            nexus-chat-${{ steps.version_bump.outputs.version }}.apk
           draft: false
-          prerelease: ${{ inputs.prerelease }}
+          prerelease: ${{ inputs.prerelease || false }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
