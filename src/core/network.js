@@ -19,8 +19,8 @@ export class P2PNetwork {
   async init() {
     this.channel.onmessage = (e) => this.handleMessage(e.data);
 
-    // Periodically clean seen messages to save memory
-    setInterval(() => this.seenMessages.clear(), 3600000);
+    // BUG 11: Clear every 5 minutes (was 1 hour) to cap memory growth during active sessions
+    setInterval(() => this.seenMessages.clear(), 5 * 60 * 1000);
 
     this.broadcast('HELLO', { nodeId: this.nodeId });
   }
@@ -60,12 +60,23 @@ export class P2PNetwork {
   }
 
   broadcast(type, payload, existingMsgId = null) {
-    const msgId = existingMsgId || Math.random().toString(36).substring(7);
+    const msgId = existingMsgId || crypto.randomUUID();
     this.channel.postMessage({ from: this.nodeId, type, payload, msgId });
   }
 
   send(type, payload, to) {
-    this.channel.postMessage({ from: this.nodeId, type, payload, to });
+    const msgId = crypto.randomUUID();
+    this.channel.postMessage({ from: this.nodeId, type, payload, to, msgId });
+  }
+
+  /**
+   * Gossip a CRDT delta to all peers via BroadcastChannel.
+   * Called by ChatEngine, useNexus, etc. to propagate local changes.
+   * @param {Object} delta - Partial state (e.g. { users: {...}, messages: {...} })
+   */
+  gossip(delta) {
+    if (!this.isOnline) return;
+    this.broadcast('GOSSIP', delta);
   }
 
   // Placeholder for real WebRTC multi-device signaling
@@ -76,6 +87,6 @@ export class P2PNetwork {
 
   toggleOnline() {
     this.isOnline = !this.isOnline;
-    if (this.isOnline) this.broadcast('HELLO', {});
+    if (this.isOnline) this.broadcast('HELLO', { nodeId: this.nodeId });
   }
 }

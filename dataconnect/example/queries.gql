@@ -1,0 +1,30 @@
+mutation CreateUser($githubUsername: String!, $email: String!, $avatarUrl: String) @auth(level: USER) {
+  user_insert(data: {
+    githubUsername: $githubUsername,
+    email: $email,
+    avatarUrl: $avatarUrl
+  })
+}
+
+mutation CreateRepository($name: String!, $githubUrl: String!, $userId: UUID!) @auth(level: USER) {
+  repository_insert(data: {
+    name: $name,
+    githubUrl: $githubUrl,
+    userId: $userId
+  })
+}
+
+query ListRepositories @auth(level: USER) {
+  repositories {
+    id
+    name
+    githubUrl
+    user {
+      githubUsername
+    }
+  }
+}
+
+mutation UpdateAnalysisScore($id: UUID!, $score: Int!) @auth(level: USER) {
+  analysis_update(id: $id, data: { score: $score })
+}

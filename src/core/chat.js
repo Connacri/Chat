@@ -11,10 +11,16 @@ export class ChatEngine {
   }
 
   async sendMessage(chatId, content, type = 'text', recipientDid) {
-    const encryptedContent = await security.encrypt(content, recipientDid);
+    // Look up recipient's ECDH public key from the local DB
+    const recipient = await db.get('users', recipientDid);
+    if (!recipient?.ecdhPublicKey) {
+      throw new Error(`[Chat] No ECDH public key found for recipient ${recipientDid}. They must be in your local DB.`);
+    }
+
+    const encryptedContent = await security.encrypt(content, recipient.ecdhPublicKey);
 
     const msg = {
-      id: Math.random().toString(36).substring(7),
+      id: crypto.randomUUID(),
       chatId,
       from: this.nexus.currentUser.id,
       content: encryptedContent,
@@ -30,7 +36,7 @@ export class ChatEngine {
 
   async createGroup(name, memberDids) {
     const group = {
-      id: `group-${Math.random().toString(36).substring(7)}`,
+      id: `group-${crypto.randomUUID()}`, // BUG 9: use UUID for sufficient entropy
       name,
       members: [this.nexus.currentUser.id, ...memberDids],
       admin: this.nexus.currentUser.id,

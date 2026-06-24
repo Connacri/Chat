@@ -1,0 +1,37 @@
+type User @table {
+  githubUsername: String!
+  email: String!
+  avatarUrl: String
+  createdAt: Timestamp
+}
+
+type Repository @table {
+  name: String!
+  githubUrl: String!
+  user: User!
+  lastSyncedAt: Timestamp
+  description: String
+}
+
+type ReadmeFile @table {
+  content: String!
+  repository: Repository!
+  version: String
+  rawUrl: String
+}
+
+type Analysis @table {
+  score: Int!
+  rawFeedback: String!
+  readmeFile: ReadmeFile!
+  suggestedImprovements: String
+  createdAt: Timestamp
+}
+
+type Suggestion @table {
+  title: String!
+  severity: String!
+  analysis: Analysis!
+  description: String
+  isImplemented: Boolean
+}

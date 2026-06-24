@@ -1,0 +1,14 @@
+mutation CreateSeedData @transaction {
+  user_insertMany(data: [
+    {
+      id_expr: "uuidV4()",
+      githubUsername: "demouser1",
+      email: "demo1@example.com"
+    },
+    {
+      id_expr: "uuidV4()",
+      githubUsername: "demouser2",
+      email: "demo2@example.com"
+    }
+  ])
+}

@@ -28,8 +28,9 @@ export class SearchIndex {
 
   search(filters) {
     return Array.from(this.index.values()).filter(u => {
-      if (filters.name && !u.name.includes(filters.name.toLowerCase())) return false;
-      if (filters.city && !u.city.includes(filters.city.toLowerCase())) return false;
+      // BUG 5: guard against null/undefined name or city before calling .includes()
+      if (filters.name && !(u.name && u.name.includes(filters.name.toLowerCase()))) return false;
+      if (filters.city && !(u.city && u.city.includes(filters.city.toLowerCase()))) return false;
       if (filters.minAge && u.age < filters.minAge) return false;
       if (filters.maxAge && u.age > filters.maxAge) return false;
       if (filters.verified !== undefined && u.verified !== filters.verified) return false;

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React from 'react'; // BUG 8: removed unused useState and useEffect
 
 const AdminDashboard = ({ users }) => {
   const allUsers = Object.values(users);

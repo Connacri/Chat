@@ -5,13 +5,15 @@ on:
     branches:
       - main
       - master
+    paths-ignore:
+      - 'package.json' # Avoid infinite loop when version is bumped
 
 jobs:
   version:
     runs-on: ubuntu-latest
-    if: "!contains(github.event.head_commit.message, 'skip ci')"
+    if: "!contains(github.event.head_commit.message, 'skip ci') && !contains(github.event.head_commit.message, 'chore: bump version')"
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -24,4 +26,4 @@ jobs:
       - name: Bump version and push tag
         run: |
           npm version patch -m "chore: bump version to %s [skip ci]"
-          git push origin master --tags
+          git push origin HEAD:${{ github.ref_name }} --tags

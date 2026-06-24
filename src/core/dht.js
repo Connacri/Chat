@@ -17,8 +17,11 @@ export class DHT {
   }
 
   distance(a, b) {
-    // Simplified XOR distance
-    return parseInt(a, 36) ^ parseInt(b, 36);
+    // BUG 10: UUIDs contain hyphens — parseInt(..., 36) stops at the first '-'.
+    // Use the first 8 hex chars of the UUID (hyphens stripped) as a 32-bit int.
+    const hexA = a.replace(/-/g, '').substring(0, 8);
+    const hexB = b.replace(/-/g, '').substring(0, 8);
+    return (parseInt(hexA, 16) ^ parseInt(hexB, 16)) >>> 0;
   }
 
   async store(key, value) {
