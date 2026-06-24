@@ -6,16 +6,6 @@ on:
       - main
       - master
   workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version tag à publier (ex: v1.2.3, laisser vide pour incrémentation automatique)'
-        required: false
-        type: string
-      prerelease:
-        description: 'Marquer comme pre-release ?'
-        required: false
-        type: boolean
-        default: false
 
 jobs:
   release:
@@ -47,12 +37,33 @@ jobs:
             const fs = require("fs");
             const { execSync } = require("child_process");
             
-            let newVersion = "${{ inputs.version }}".trim();
+            let latestTag = "";
+            try {
+              execSync("git fetch --tags");
+              const tagList = execSync("git tag -l").toString().split("\n").map(t => t.trim()).filter(Boolean);
+              console.log("Found tags in repository:", tagList);
+              
+              const semverTags = tagList.filter(t => /^v?\d+\.\d+\.\d+$/.test(t));
+              if (semverTags.length > 0) {
+                // Sort in descending order based on semver
+                semverTags.sort((a, b) => {
+                  const partsA = a.replace(/^v/, "").split(".").map(Number);
+                  const partsB = b.replace(/^v/, "").split(".").map(Number);
+                  for (let i = 0; i < 3; i++) {
+                    if (partsA[i] !== partsB[i]) {
+                      return partsB[i] - partsA[i];
+                    }
+                  }
+                  return 0;
+                });
+                latestTag = semverTags[0];
+              }
+            } catch (e) {
+              console.log("Error listing tags, falling back to git describe:", e.message);
+            }
             
-            if (!newVersion) {
-              let latestTag = "";
+            if (!latestTag) {
               try {
-                execSync("git fetch --tags");
                 latestTag = execSync("git describe --tags --abbrev=0").toString().trim();
               } catch (e) {
                 try {
@@ -61,21 +72,17 @@ jobs:
                   latestTag = "v1.0.0";
                 }
               }
-              console.log("Latest tag found: " + latestTag);
-              
-              const match = latestTag.match(/v?(\d+)\.(\d+)\.(\d+)/);
-              let major = 1, minor = 0, patch = 0;
-              if (match) {
-                major = parseInt(match[1], 10);
-                minor = parseInt(match[2], 10);
-                patch = parseInt(match[3], 10) + 1;
-              }
-              newVersion = `${major}.${minor}.${patch}`;
-            } else {
-              if (newVersion.startsWith("v")) {
-                newVersion = newVersion.substring(1);
-              }
             }
+            console.log("Latest tag found: " + latestTag);
+            
+            const match = latestTag.match(/v?(\d+)\.(\d+)\.(\d+)/);
+            let major = 1, minor = 0, patch = 0;
+            if (match) {
+              major = parseInt(match[1], 10);
+              minor = parseInt(match[2], 10);
+              patch = parseInt(match[3], 10) + 1;
+            }
+            let newVersion = `${major}.${minor}.${patch}`;
             
             const newTag = `v${newVersion}`;
             console.log("Using version: " + newVersion);
@@ -219,6 +226,6 @@ jobs:
             nexus-web-${{ steps.version_bump.outputs.version }}.zip
             nexus-chat-${{ steps.version_bump.outputs.version }}.apk
           draft: false
-          prerelease: ${{ inputs.prerelease || false }}
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
