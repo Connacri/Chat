@@ -32,14 +32,8 @@ export const googleProvider = new GoogleAuthProvider();
 
 /**
  * Connexion Google (popup)
- * @returns {Promise<UserCredential>}
  */
 export const signInWithGoogle = () => signInWithPopup(auth, googleProvider);
-
-/**
- * Connexion téléphone : utilise RecaptchaVerifier + signInWithPhoneNumber
- * (à implémenter selon le besoin, voir firebase/auth docs)
- */
 
 /**
  * Déconnexion

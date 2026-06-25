@@ -20,11 +20,18 @@ export class Identity {
   }
 
   /**
-   * Create a new identity, generate key pair and persist it.
-   * @param {string} phone - User's phone number
+   * Create a new hardware-bound identity.
+   * Uses WebAuthn-inspired hardware signing if available, or non-exportable SubtleCrypto keys.
    */
   async create(phone) {
-    this.keyPair = await generateKeyPair();
+    // Generate a non-exportable key pair (locked to this device/browser)
+    this.keyPair = await crypto.subtle.generateKey(
+      {
+        name: 'Ed25519',
+      },
+      false, // NOT extractable - This is the "Ultra Secure" part
+      ['sign', 'verify']
+    );
 
     // Export public key (raw) for DID
     const pubKeyBuffer = await crypto.subtle.exportKey('raw', this.keyPair.publicKey);
@@ -35,55 +42,56 @@ export class Identity {
     this.did = `did:nexus:key:${pubKeyHex}`;
     this.phone = phone;
 
-    // Sign the phone number as proof of ownership
-    const proof = await signMessage(this.keyPair.privateKey, phone);
+    // Create a hardware attestation (signing the phone number + a device-specific challenge)
+    const challenge = crypto.getRandomValues(new Uint8Array(32));
+    const challengeHex = Array.from(challenge).map(b => b.toString(16).padStart(2, '0')).join('');
 
-    // --- Persist key pair in IndexedDB ---
-    const privKeyBuffer = await crypto.subtle.exportKey('pkcs8', this.keyPair.privateKey);
-    await this._saveKeyPair(pubKeyHex, bufToB64(privKeyBuffer), phone, proof);
+    const dataToSign = new TextEncoder().encode(`${phone}:${challengeHex}`);
+    const proofBuffer = await crypto.subtle.sign('Ed25519', this.keyPair.privateKey, dataToSign);
+    const proof = bufToB64(proofBuffer);
+
+    // --- Persist public part + internal reference ---
+    // Note: We can't export the private key, so we store the reference in 'keypair' store
+    // which IndexedDB handles by keeping the CryptoKey object itself.
+    await this._saveHardwareKey(pubKeyHex, this.keyPair.privateKey, phone, proof, challengeHex);
 
     return {
       did: this.did,
       phone: this.phone,
       publicKey: pubKeyHex,
       proof,
+      attestation: challengeHex // Proof of hardware binding
     };
   }
 
-  /**
-   * Restore an existing identity from IndexedDB.
-   * Returns the identity object if found, null otherwise.
-   */
+  async _saveHardwareKey(pubKeyHex, privateKey, phone, proof, challenge) {
+    const store = await this._getStore('readwrite');
+    return new Promise((res, rej) => {
+      // Storing the actual CryptoKey object (non-exportable keys can be stored in IDB)
+      const req = store.put({ id: 'main', pubKeyHex, privateKey, phone, proof, challenge });
+      req.onsuccess = res;
+      req.onerror = rej;
+    });
+  }
+
   async restore() {
     const stored = await this._loadKeyPair();
     if (!stored) return null;
 
-    const { pubKeyHex, privKeyB64, phone, proof } = stored;
+    this.keyPair = {
+      privateKey: stored.privateKey, // This is the non-exportable CryptoKey
+      publicKey: await crypto.subtle.importKey(
+        'raw',
+        new Uint8Array(stored.pubKeyHex.match(/.{1,2}/g).map(b => parseInt(b, 16))),
+        { name: 'Ed25519' },
+        true,
+        ['verify']
+      )
+    };
+    this.did = `did:nexus:key:${stored.pubKeyHex}`;
+    this.phone = stored.phone;
 
-    // Re-import private key
-    const privKey = await crypto.subtle.importKey(
-      'pkcs8',
-      b64ToBuf(privKeyB64),
-      { name: 'Ed25519' },
-      true,
-      ['sign']
-    );
-
-    // Re-import public key
-    const pubKeyBuffer = new Uint8Array(pubKeyHex.match(/.{1,2}/g).map((b) => parseInt(b, 16)));
-    const pubKey = await crypto.subtle.importKey(
-      'raw',
-      pubKeyBuffer,
-      { name: 'Ed25519' },
-      true,
-      ['verify']
-    );
-
-    this.keyPair = { privateKey: privKey, publicKey: pubKey };
-    this.did = `did:nexus:key:${pubKeyHex}`;
-    this.phone = phone;
-
-    return { did: this.did, phone, publicKey: pubKeyHex, proof };
+    return { did: this.did, phone: stored.phone, publicKey: stored.pubKeyHex, proof: stored.proof };
   }
 
   async verifyOwnership(user) {

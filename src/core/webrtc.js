@@ -91,13 +91,25 @@ export class WebRTCP2P {
   setupDataChannel(dc, peerId) {
     this.dataChannels.set(peerId, dc);
     dc.onmessage = (e) => {
-      this.onMessage(JSON.parse(e.data), peerId);
+      try {
+        const data = JSON.parse(e.data);
+        this.onMessage(data, peerId);
+      } catch (err) {
+        console.warn("[WebRTC] Failed to parse message", err);
+      }
     };
-    dc.onopen = () => console.log(`[WebRTC] DataChannel open with ${peerId}`);
+    dc.onopen = () => {
+      console.log(`[WebRTC] DataChannel open with ${peerId}`);
+      // Send a ping/hello to confirm channel is working
+      dc.send(JSON.stringify({ from: this.nodeId, type: 'RTC_HELLO' }));
+    };
     dc.onclose = () => {
       console.log(`[WebRTC] DataChannel closed with ${peerId}`);
       this.peers.delete(peerId);
       this.dataChannels.delete(peerId);
+    };
+    dc.onerror = (err) => {
+      console.error(`[WebRTC] DataChannel error with ${peerId}:`, err);
     };
   }
 
@@ -119,9 +131,14 @@ export class WebRTCP2P {
 
   broadcast(message) {
     const data = JSON.stringify(message);
-    this.peers.forEach((pc) => {
-      // In a real broadcast, we'd need to track open data channels
-      // This is simplified: assuming we have channels open
+    this.dataChannels.forEach((dc, peerId) => {
+      if (dc.readyState === 'open') {
+        try {
+          dc.send(data);
+        } catch (err) {
+          console.warn(`[WebRTC] Failed to send broadcast to ${peerId}`, err);
+        }
+      }
     });
   }
 }
