@@ -37,65 +37,129 @@ const CRDT = {
 class NexusDB {
   constructor() {
     this.db = null;
+    this.memoryStore = { users: {}, messages: {}, groups: {}, friends: {}, state: {} };
     this.ready = this._open();
   }
 
   _open() {
-    return new Promise((res, rej) => {
-      const req = indexedDB.open("nexus_chat_v4", 1);
-      req.onupgradeneeded = (e) => {
-        const db = e.target.result;
-        ["users", "messages", "groups", "friends", "state"].forEach((s) => {
-          if (!db.objectStoreNames.contains(s))
-            db.createObjectStore(s, { keyPath: "id" });
-        });
-      };
-      req.onsuccess = (e) => { this.db = e.target.result; res(); };
-      req.onerror = rej;
+    return new Promise((res) => {
+      if (typeof indexedDB === "undefined") {
+        console.warn("IndexedDB is not supported in this environment. Falling back to in-memory storage.");
+        res();
+        return;
+      }
+      try {
+        const req = indexedDB.open("nexus_chat_v4", 1);
+        req.onupgradeneeded = (e) => {
+          const db = e.target.result;
+          ["users", "messages", "groups", "friends", "state"].forEach((s) => {
+            if (!db.objectStoreNames.contains(s))
+              db.createObjectStore(s, { keyPath: "id" });
+          });
+        };
+        req.onsuccess = (e) => {
+          this.db = e.target.result;
+          res();
+        };
+        req.onerror = (err) => {
+          console.warn("IndexedDB open error, falling back to in-memory storage:", err);
+          res();
+        };
+      } catch (e) {
+        console.warn("IndexedDB open exception, falling back to in-memory storage:", e);
+        res();
+      }
     });
   }
 
   async get(store, id) {
     await this.ready;
-    return new Promise((res, rej) => {
-      if (!this.db) { res(null); return; }
-      const tx = this.db.transaction(store, "readonly");
-      const req = tx.objectStore(store).get(id);
-      req.onsuccess = () => res(req.result || null);
-      req.onerror = rej;
+    if (!this.db) {
+      return this.memoryStore[store]?.[id] || null;
+    }
+    return new Promise((res) => {
+      try {
+        const tx = this.db.transaction(store, "readonly");
+        const req = tx.objectStore(store).get(id);
+        req.onsuccess = () => res(req.result || null);
+        req.onerror = () => res(null);
+      } catch (e) {
+        console.warn(`IndexedDB get error for ${store}/${id}:`, e);
+        res(this.memoryStore[store]?.[id] || null);
+      }
     });
   }
 
   async getAll(store) {
     await this.ready;
-    return new Promise((res, rej) => {
-      if (!this.db) { res([]); return; }
-      const tx = this.db.transaction(store, "readonly");
-      const req = tx.objectStore(store).getAll();
-      req.onsuccess = () => res(req.result || []);
-      req.onerror = rej;
+    if (!this.db) {
+      return Object.values(this.memoryStore[store] || {});
+    }
+    return new Promise((res) => {
+      try {
+        const tx = this.db.transaction(store, "readonly");
+        const req = tx.objectStore(store).getAll();
+        req.onsuccess = () => res(req.result || []);
+        req.onerror = () => res([]);
+      } catch (e) {
+        console.warn(`IndexedDB getAll error for ${store}:`, e);
+        res(Object.values(this.memoryStore[store] || {}));
+      }
     });
   }
 
   async put(store, obj) {
     await this.ready;
-    return new Promise((res, rej) => {
-      if (!this.db) { res(); return; }
-      const tx = this.db.transaction(store, "readwrite");
-      const req = tx.objectStore(store).put(obj);
-      req.onsuccess = () => res();
-      req.onerror = rej;
+    if (!this.db) {
+      if (obj && obj.id) {
+        if (!this.memoryStore[store]) this.memoryStore[store] = {};
+        this.memoryStore[store][obj.id] = obj;
+      }
+      return;
+    }
+    return new Promise((res) => {
+      try {
+        const tx = this.db.transaction(store, "readwrite");
+        const req = tx.objectStore(store).put(obj);
+        req.onsuccess = () => res();
+        req.onerror = () => {
+          if (obj && obj.id) {
+            if (!this.memoryStore[store]) this.memoryStore[store] = {};
+            this.memoryStore[store][obj.id] = obj;
+          }
+          res();
+        };
+      } catch (e) {
+        console.warn(`IndexedDB put error for ${store}:`, e);
+        if (obj && obj.id) {
+          if (!this.memoryStore[store]) this.memoryStore[store] = {};
+          this.memoryStore[store][obj.id] = obj;
+        }
+        res();
+      }
     });
   }
 
   async clear(store) {
     await this.ready;
-    return new Promise((res, rej) => {
-      if (!this.db) { res(); return; }
-      const tx = this.db.transaction(store, "readwrite");
-      const req = tx.objectStore(store).clear();
-      req.onsuccess = () => res();
-      req.onerror = rej;
+    if (!this.db) {
+      this.memoryStore[store] = {};
+      return;
+    }
+    return new Promise((res) => {
+      try {
+        const tx = this.db.transaction(store, "readwrite");
+        const req = tx.objectStore(store).clear();
+        req.onsuccess = () => res();
+        req.onerror = () => {
+          this.memoryStore[store] = {};
+          res();
+        };
+      } catch (e) {
+        console.warn(`IndexedDB clear error for ${store}:`, e);
+        this.memoryStore[store] = {};
+        res();
+      }
     });
   }
 }
@@ -339,12 +403,17 @@ export default function App() {
   const [isOnline, setIsOnline] = useState(true);
   const [p2p, setP2p] = useState(null);
   const [nodeId] = useState(() => {
-    let id = localStorage.getItem('nexus_nodeId');
-    if (!id) {
-      id = uid();
-      localStorage.setItem('nexus_nodeId', id);
+    try {
+      let id = localStorage.getItem('nexus_nodeId');
+      if (!id) {
+        id = uid();
+        localStorage.setItem('nexus_nodeId', id);
+      }
+      return id;
+    } catch (e) {
+      console.warn("localStorage access blocked or unavailable, using ephemeral nodeId:", e);
+      return uid();
     }
-    return id;
   });
   const [toast, setToast] = useState(null);
   const [simVerifying, setSimVerifying] = useState(false);
