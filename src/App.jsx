@@ -192,9 +192,9 @@ class P2PSync {
     this._announcePresence();
 
     // Periodic presence announcement
-    this._presenceInterval = setInterval(() => {
+    this. _presenceInterval = setInterval(() => {
       if (this.online) this._announcePresence();
-    }, 60000);
+    }, 20000);
 
     // Periodic sync every 3s
     this._interval = setInterval(() => {
@@ -576,12 +576,12 @@ export default function App() {
     const heartbeat = setInterval(async () => {
       if (isOnline) {
         try {
-          await setDoc(doc(firestore, "users", currentUser.id), { ts: now(), online: true }, { merge: true });
+          await setDoc(doc(firestore, "users", currentUser.id), { ts: Date.now(), online: true }, { merge: true });
         } catch (e) {
           console.warn("Heartbeat failed", e);
         }
       }
-    }, 30000);
+    }, 15000);
 
     return () => {
       sync.destroy();
@@ -750,6 +750,9 @@ export default function App() {
         if (targetUser) {
           await db.put("users", targetUser);
           setUsers(prev => ({ ...prev, [targetUser.id]: targetUser }));
+          if (p2p && p2p.rtc) {
+            p2p.rtc.connectToPeer(targetUser.id);
+          }
         } else {
           showToast("Utilisateur introuvable", "error");
           return;
@@ -1823,7 +1826,7 @@ function AddFriendScreen({ ctx }) {
       
       return formatsToSearch.some(f => {
         const cleanF = f.replace(/[\s\-()]/g, '');
-        return uPhoneNormalized === cleanF || uNormalizedField === cleanF;
+        return uPhoneNormalized === cleanF || uNormalizedField === cleanF || u.id === f || u.nodeId === f;
       });
     });
 
@@ -1861,6 +1864,10 @@ function AddFriendScreen({ ctx }) {
       if (docData) {
         await db.put("users", docData);
         ctx.setUsers((prev) => ({ ...prev, [docData.id]: docData }));
+        // Force direct WebRTC signaling
+        if (ctx.p2p && ctx.p2p.rtc) {
+          ctx.p2p.rtc.connectToPeer(docData.id);
+        }
         setResult(docData);
         return;
       }
@@ -2005,10 +2012,22 @@ function AddFriendScreen({ ctx }) {
             
             <div style={{ color: "var(--text-dim)", fontSize: 12, marginBottom: 8, textAlign: 'left' }}>Nœuds détectés sur le réseau :</div>
             <div style={{ textAlign: 'left' }}>
-              {Object.values(ctx.users).filter((u) => u.id !== myId).map((u) => (
+              {Object.values(ctx.users).filter((u) => u.id !== myId).sort((a,b) => (b.ts || 0) - (a.ts || 0)).map((u) => (
                 <div key={u.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: "1px solid rgba(255,255,255,0.05)" }}>
                   <Avatar name={u.name} avatar={u.photos?.[0]} color={avatarColor(u.name)} size={36} />
-                  <div style={{ flex: 1, fontSize: 13, color: "#ccc" }}>{u.name}</div>
+                  <div style={{ flex: 1, fontSize: 13, color: "#ccc" }}>
+                    {u.name}
+                    {u.online && (u.ts > Date.now() - 45000) && (
+                      <span style={{
+                        display: 'inline-block',
+                        width: '8px',
+                        height: '8px',
+                        background: '#4ade80',
+                        borderRadius: '50%',
+                        marginLeft: '6px'
+                      }}></span>
+                    )}
+                  </div>
                   {myFriends.includes(u.id) ? (
                     <span style={{ color: "var(--success)", fontSize: 12, fontWeight: 'bold' }}>✓</span>
                   ) : (
@@ -2134,7 +2153,8 @@ function DiscoverScreen({ ctx }) {
       if (filterName && !u.name.toLowerCase().includes(filterName.toLowerCase())) return false;
       if (filterCity && u.city && !u.city.toLowerCase().includes(filterCity.toLowerCase())) return false;
       if (u.age && (u.age < filterMinAge || u.age > filterMaxAge)) return false;
-      return true;
+      const isOnline = u.online && (u.ts > Date.now() - 45000);
+      return isOnline;
     });
   }, [ctx.users, ctx.currentUser, ctx.friends, passedIds, filterName, filterCity, filterMinAge, filterMaxAge]);
 
