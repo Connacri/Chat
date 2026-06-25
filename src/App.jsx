@@ -101,12 +101,15 @@ class NexusDB {
 
 const db = new NexusDB();
 
-// ─── P2P Sync via BroadcastChannel ──
+import { WebRTCP2P } from "./core/webrtc";
+
+// ─── P2P Sync via WebRTC + BroadcastChannel ──
 class P2PSync {
   constructor(nodeId, onSync) {
     this.nodeId = nodeId;
     this.onSync = onSync;
     this.channel = new BroadcastChannel("nexus_p2p_v4");
+    this.rtc = new WebRTCP2P(nodeId, (payload, from) => this.onSync(payload, from));
     this.peers = new Set();
     this.online = true;
     this.pendingQueue = [];
@@ -120,8 +123,13 @@ class P2PSync {
       if (type === "SYNC" || type === "HELLO_ACK") this.onSync(payload, from);
     };
 
-    // Announce presence
-    this._broadcast("HELLO", {});
+    // Announce presence via Firestore for inter-device discovery
+    this._announcePresence();
+
+    // Periodic presence announcement
+    this._presenceInterval = setInterval(() => {
+      if (this.online) this._announcePresence();
+    }, 60000);
 
     // Periodic sync every 3s
     this._interval = setInterval(() => {
@@ -129,12 +137,44 @@ class P2PSync {
     }, 3000);
   }
 
+  async _announcePresence() {
+    try {
+      await setDoc(doc(firestore, "presence", this.nodeId), {
+        id: this.nodeId,
+        ts: Date.now(),
+        online: true
+      });
+
+      // Discovery: find other online nodes and try connecting via WebRTC
+      const q = query(collection(firestore, "presence"), where("online", "==", true), limit(20));
+      const snap = await getDocs(q);
+      snap.forEach(doc => {
+        if (doc.id !== this.nodeId) {
+          this.rtc.connectToPeer(doc.id);
+        }
+      });
+    } catch (e) {
+      console.warn("Presence announcement failed", e);
+    }
+  }
+
   _broadcast(type, payload) {
-    this.channel.postMessage({ from: this.nodeId, type, payload });
+    const data = { from: this.nodeId, type, payload };
+    this.channel.postMessage(data);
+    // Also push to WebRTC peers
+    this.rtc.peers.forEach((pc, peerId) => {
+      // Find open data channel for this peer
+      // Note: Data channel management is in WebRTCP2P
+      // For simplicity, we assume rtc handles actual data channel message forwarding
+      // I'll add a 'send' method to WebRTCP2P
+      this.rtc.sendToPeer(peerId, data);
+    });
   }
 
   _sendTo(type, payload, _to) {
-    this.channel.postMessage({ from: this.nodeId, type, payload, to: _to });
+    const data = { from: this.nodeId, type, payload, to: _to };
+    this.channel.postMessage(data);
+    this.rtc.sendToPeer(_to, data);
   }
 
   push(delta) {
@@ -152,17 +192,22 @@ class P2PSync {
     }
   }
 
-  goOffline() { this.online = false; }
+  goOffline() {
+    this.online = false;
+    setDoc(doc(firestore, "presence", this.nodeId), { online: false }, { merge: true });
+  }
 
   goOnline() {
     this.online = true;
     this._flushQueue();
-    this._broadcast("HELLO", {});
+    this._announcePresence();
   }
 
   destroy() {
     clearInterval(this._interval);
+    clearInterval(this._presenceInterval);
     this.channel.close();
+    setDoc(doc(firestore, "presence", this.nodeId), { online: false }, { merge: true });
   }
 }
 
@@ -635,7 +680,14 @@ function Toast({ msg, type }) {
 // ─── Helper Views Components ───
 function Screen({ title, subtitle, back, children }) {
   return (
-    <div className="login" style={{ padding: '24px', display: 'flex', flexDirection: 'column', gap: '16px', minHeight: '100vh' }}>
+    <div className="login" style={{
+      padding: 'calc(24px + var(--safe-area-top)) 24px calc(24px + var(--safe-area-bottom)) 24px',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '16px',
+      minHeight: '100vh',
+      background: '#09090f'
+    }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
         {back && <button onClick={back} style={{ background: '#1c1c2e', padding: '8px 12px', borderRadius: '8px', border: 'none', color: '#fff', cursor: 'pointer' }}>←</button>}
         <div>
@@ -757,13 +809,22 @@ function IconBtn({ icon, onClick, title }) {
 // ─── AppShell Wrapper Component ───
 function AppShell({ children, activeTab, ctx, noNav = false }) {
   return (
-    <div className="app-container" style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
-      {/* Header */}
-      <header>
+    <div className="app-container" style={{
+      height: '100vh',
+      display: 'flex',
+      flexDirection: 'column',
+      background: '#09090f',
+      overflow: 'hidden'
+    }}>
+      {/* Header with Safe Area Top Padding */}
+      <header style={{
+        paddingTop: 'calc(12px + var(--safe-area-top))',
+        flexShrink: 0
+      }}>
         <div style={{ display: 'flex', flexDirection: 'column' }}>
           <h1 onClick={() => ctx.setView(VIEWS.HOME)} style={{ cursor: 'pointer' }}>Nexus P2P</h1>
-          <span style={{ fontSize: '0.7rem', color: 'var(--text-dim)' }}>
-            Nœud: {ctx.currentUser?.id?.substring(0, 12)}...
+          <span style={{ fontSize: '0.7rem', color: 'var(--text-dim)', wordBreak: 'break-all' }}>
+            ID: {ctx.currentUser?.id}
           </span>
         </div>
         <div className="connection-status">
@@ -785,43 +846,77 @@ function AppShell({ children, activeTab, ctx, noNav = false }) {
         </div>
       </header>
 
-      {/* Screen Content */}
-      <div style={{ flex: 1, paddingBottom: noNav ? '0px' : '75px' }}>
+      {/* Main Content with Scroll Area */}
+      <main style={{
+        flex: 1,
+        overflowY: 'auto',
+        WebkitOverflowScrolling: 'touch', // Smooth scroll on iOS
+        paddingBottom: noNav ? 'calc(20px + var(--safe-area-bottom))' : '100px'
+      }}>
         {children}
-      </div>
+      </main>
 
-      {/* Bottom Nav Bar */}
+      {/* Floating Bottom Nav Bar with Safe Area Bottom Padding */}
       {!noNav && (
-        <nav className="tabs-navigation" style={{ position: 'fixed', bottom: 0, left: 0, right: 0, maxWidth: '500px', margin: '0 auto', top: 'auto', borderBottom: 'none', borderTop: 'var(--glass-border)' }}>
+        <nav className="tabs-navigation" style={{
+          position: 'fixed',
+          bottom: 'calc(12px + var(--safe-area-bottom))',
+          left: '12px',
+          right: '12px',
+          maxWidth: '476px',
+          margin: '0 auto',
+          borderRadius: '24px',
+          background: 'rgba(20, 20, 35, 0.85)',
+          backdropFilter: 'blur(20px)',
+          WebkitBackdropFilter: 'blur(20px)',
+          border: '1px solid rgba(255, 255, 255, 0.1)',
+          boxShadow: '0 8px 32px rgba(0, 0, 0, 0.5)',
+          padding: '8px 12px',
+          height: '64px',
+          display: 'flex',
+          justifyContent: 'space-around',
+          alignItems: 'center',
+          zIndex: 1000
+        }}>
           <button
             className={`tab-btn ${activeTab === 'home' ? 'active' : ''}`}
             onClick={() => ctx.setView(VIEWS.HOME)}
+            style={{ flex: 1, background: 'transparent', border: 'none', color: activeTab === 'home' ? 'var(--primary)' : '#888', fontSize: '0.7rem', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px' }}
           >
-            💬 Chat
+            <span style={{ fontSize: '1.2rem' }}>💬</span>
+            <span>Chat</span>
           </button>
           <button
             className={`tab-btn ${activeTab === 'discover' ? 'active' : ''}`}
             onClick={() => ctx.setView(VIEWS.DISCOVER)}
+            style={{ flex: 1, background: 'transparent', border: 'none', color: activeTab === 'discover' ? 'var(--primary)' : '#888', fontSize: '0.7rem', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px' }}
           >
-            🔥 Discover
+            <span style={{ fontSize: '1.2rem' }}>🔥</span>
+            <span>Discover</span>
           </button>
           <button
             className={`tab-btn ${activeTab === 'groups' ? 'active' : ''}`}
             onClick={() => ctx.setView(VIEWS.GROUPS)}
+            style={{ flex: 1, background: 'transparent', border: 'none', color: activeTab === 'groups' ? 'var(--primary)' : '#888', fontSize: '0.7rem', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px' }}
           >
-            👥 Groupes
+            <span style={{ fontSize: '1.2rem' }}>👥</span>
+            <span>Groupes</span>
           </button>
           <button
             className={`tab-btn ${activeTab === 'friends' ? 'active' : ''}`}
             onClick={() => ctx.setView(VIEWS.FRIENDS)}
+            style={{ flex: 1, background: 'transparent', border: 'none', color: activeTab === 'friends' ? 'var(--primary)' : '#888', fontSize: '0.7rem', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px' }}
           >
-            👤 Amis
+            <span style={{ fontSize: '1.2rem' }}>👤</span>
+            <span>Amis</span>
           </button>
           <button
             className={`tab-btn ${activeTab === 'profile' ? 'active' : ''}`}
             onClick={() => ctx.setView(VIEWS.PROFILE)}
+            style={{ flex: 1, background: 'transparent', border: 'none', color: activeTab === 'profile' ? 'var(--primary)' : '#888', fontSize: '0.7rem', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px' }}
           >
-            ⚙️ Profil
+            <span style={{ fontSize: '1.2rem' }}>⚙️</span>
+            <span>Profil</span>
           </button>
         </nav>
       )}
@@ -1081,9 +1176,9 @@ function ChatScreen({ ctx, isGroup }) {
   const otherUser = !isGroup ? ctx.users[chat.user?.id] : null;
 
   return (
-    <div className="app-container" style={{ minHeight: "100vh", display: "flex", flexDirection: "column" }}>
+    <div className="app-container" style={{ height: "100vh", display: "flex", flexDirection: "column", overflow: 'hidden' }}>
       {/* Header */}
-      <div className="chat-header">
+      <div className="chat-header" style={{ paddingTop: 'calc(12px + var(--safe-area-top))' }}>
         <IconBtn icon="←" onClick={() => ctx.setView(isGroup ? VIEWS.GROUPS : VIEWS.HOME)} />
         <Avatar name={chat.name} avatar={isGroup ? null : otherUser?.photos?.[0]} color={avatarColor(chat.name)} size={38} verified={otherUser?.verified} />
         <div style={{ flex: 1, marginLeft: '4px' }}>
@@ -1098,7 +1193,7 @@ function ChatScreen({ ctx, isGroup }) {
       </div>
 
       {/* Messages Area */}
-      <div style={{ flex: 1, overflowY: "auto", padding: "16px", display: "flex", flexDirection: "column", gap: 12 }}>
+      <div style={{ flex: 1, overflowY: "auto", padding: "16px", display: "flex", flexDirection: "column", gap: 12, WebkitOverflowScrolling: 'touch' }}>
         {grouped.map((item, i) =>
           item.type === "date" ? (
             <div key={i} style={{ textAlign: "center", fontSize: 10, color: "#555", margin: "8px 0" }}>{item.label}</div>
@@ -1114,8 +1209,12 @@ function ChatScreen({ ctx, isGroup }) {
         <div ref={endRef} />
       </div>
 
-      {/* Input Bar */}
-      <div className="chat-input-bar">
+      {/* Input Bar with Bottom SafeArea */}
+      <div className="chat-input-bar" style={{
+        paddingBottom: 'calc(12px + var(--safe-area-bottom))',
+        background: 'rgba(15, 15, 25, 0.95)',
+        backdropFilter: 'blur(10px)'
+      }}>
         <input
           value={input}
           onChange={(e) => setInput(e.target.value)}
@@ -1402,13 +1501,14 @@ function AddFriendScreen({ ctx }) {
   const myFriends = ctx.friends[myId] || [];
 
   const search = async () => {
-    const cleanPhone = phone.trim().replace(/\s+/g, '');
+    const cleanPhone = phone.trim().replace(/\s+/g, '').replace(/-/g, '');
     if (!cleanPhone) return;
 
     // Search local users first
-    const foundLocal = Object.values(ctx.users).find((u) =>
-      u.phone.replace(/\s+/g, '') === cleanPhone && u.id !== myId
-    );
+    const foundLocal = Object.values(ctx.users).find((u) => {
+      const uPhone = (u.phone || "").toString().trim().replace(/\s+/g, '').replace(/-/g, '');
+      return uPhone === cleanPhone && u.id !== myId;
+    });
 
     if (foundLocal) {
       setResult(foundLocal);
@@ -1417,19 +1517,19 @@ function AddFriendScreen({ ctx }) {
 
     try {
       const usersRef = collection(firestore, "users");
-      // Note: This still requires the stored phone to be "clean" or matches exactly.
-      // Better: stored phone should be normalized.
+      // Search exact and also normalized
       const q = query(usersRef, where("phone", "==", phone.trim()));
-      const querySnapshot = await getDocs(q);
+      const q2 = query(usersRef, where("phone", "==", cleanPhone));
       
-      if (!querySnapshot.empty) {
-        const docData = querySnapshot.docs[0].data();
-        if (docData.id !== myId) {
-          await db.put("users", docData);
-          ctx.setUsers((prev) => ({ ...prev, [docData.id]: docData }));
-          setResult(docData);
-          return;
-        }
+      const [snap1, snap2] = await Promise.all([getDocs(q), getDocs(q2)]);
+
+      const docData = !snap1.empty ? snap1.docs[0].data() : (!snap2.empty ? snap2.docs[0].data() : null);
+
+      if (docData && docData.id !== myId) {
+        await db.put("users", docData);
+        ctx.setUsers((prev) => ({ ...prev, [docData.id]: docData }));
+        setResult(docData);
+        return;
       }
     } catch (e) {
       console.error("Error searching in Firestore:", e);
