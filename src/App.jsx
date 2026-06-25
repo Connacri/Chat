@@ -292,6 +292,40 @@ const getDetectedPhoneNumber = (nodeId) => {
   return `+33 6 ${lastDigits.slice(0, 2)} ${lastDigits.slice(2, 4)} ${lastDigits.slice(4, 6)} ${lastDigits.slice(6, 8)}`;
 };
 
+// Compression et redimensionnement d'image pour respecter la limite de taille Firestore (1 Mo)
+const compressImage = (base64Str, maxWidth = 400, maxHeight = 400, quality = 0.7) => {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.src = base64Str;
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      let width = img.width;
+      let height = img.height;
+
+      if (width > height) {
+        if (width > maxWidth) {
+          height = Math.round((height * maxWidth) / width);
+          width = maxWidth;
+        }
+      } else {
+        if (height > maxHeight) {
+          width = Math.round((width * maxHeight) / height);
+          height = maxHeight;
+        }
+      }
+
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, width, height);
+      resolve(canvas.toDataURL('image/jpeg', quality));
+    };
+    img.onerror = () => {
+      resolve(base64Str);
+    };
+  });
+};
+
 // ─── MAIN APP ─────────────────────────────────────────────────
 export default function App() {
   const [view, setView] = useState(VIEWS.SPLASH);
@@ -400,21 +434,33 @@ export default function App() {
     // Use onSnapshot for real-time updates and discovery
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const fetchedUsers = {};
+      let needsOwnUpdate = false;
+      
       snapshot.forEach((doc) => {
         const u = doc.data();
         fetchedUsers[u.id] = u;
         db.put("users", u); // Keep local DB in sync
+        
+        // If our own profile in Firestore is missing normalizedPhone or nodeId, flag it for auto-update
+        if (u.id === currentUser.id && (!u.normalizedPhone || !u.nodeId)) {
+          needsOwnUpdate = true;
+        }
       });
 
       setUsers((prev) => {
         return { ...prev, ...fetchedUsers };
       });
+
+      if (needsOwnUpdate) {
+        console.log("[Migration] Auto-updating own profile in Firestore with normalizedPhone and nodeId...");
+        updateProfile({});
+      }
     }, (error) => {
       console.error("Firestore snapshot error:", error);
     });
 
     return () => unsubscribe();
-  }, [currentUser]);
+  }, [currentUser, nodeId, updateProfile]);
 
   // ── P2P init ──
   useEffect(() => {
@@ -491,6 +537,8 @@ export default function App() {
           id: idData.did,
           name: data.name,
           phone: detectedPhone,
+          normalizedPhone: detectedPhone.replace(/[\s\-()]/g, ''),
+          nodeId: nodeId,
           publicKey: idData.publicKey,
           proof: idData.proof, // Signed phone + challenge
           attestation: idData.attestation,
@@ -616,11 +664,22 @@ export default function App() {
     let targetUser = users[targetId];
     if (!targetUser) {
       try {
+        // Try direct document ID lookup (for DIDs)
         const userDoc = await getDoc(doc(firestore, "users", targetId));
         if (userDoc.exists()) {
           targetUser = userDoc.data();
+        } else {
+          // If not found, try querying by nodeId field (fallback for nodeIds)
+          const q = query(collection(firestore, "users"), where("nodeId", "==", targetId));
+          const snap = await getDocs(q);
+          if (!snap.empty) {
+            targetUser = snap.docs[0].data();
+          }
+        }
+
+        if (targetUser) {
           await db.put("users", targetUser);
-          setUsers(prev => ({ ...prev, [targetId]: targetUser }));
+          setUsers(prev => ({ ...prev, [targetUser.id]: targetUser }));
         } else {
           showToast("Utilisateur introuvable", "error");
           return;
@@ -671,7 +730,13 @@ export default function App() {
 
   // ── Update Profile ──
   const updateProfile = useCallback(async (updates) => {
-    const updated = { ...currentUser, ...updates, ts: now() };
+    const updated = { 
+      ...currentUser, 
+      ...updates, 
+      normalizedPhone: (updates.phone || currentUser?.phone || "").replace(/[\s\-()]/g, ''),
+      nodeId: nodeId,
+      ts: now() 
+    };
     await db.put("users", updated);
     
     try {
@@ -687,7 +752,7 @@ export default function App() {
       return next;
     });
     showToast("Profil mis à jour!", "success");
-  }, [currentUser, broadcast, showToast]);
+  }, [currentUser, broadcast, showToast, nodeId]);
 
   // ── Toggle Online ──
   const toggleOnline = useCallback(() => {
@@ -1402,7 +1467,43 @@ function ProfileScreen({ ctx }) {
 
       <div style={{ padding: 20 }}>
         {/* Bio */}
-        {user.bio && <div style={{ color: "#ccc", fontSize: 14, lineHeight: 1.5, marginBottom: 20 }}>{user.bio}</div>}
+        {user.bio && <div style={{ color: "#ccc", fontSize: 14, lineHeight: 1.5, marginBottom: 15 }}>{user.bio}</div>}
+
+        {/* Credentials Info Box */}
+        <div style={{ background: '#131324', borderRadius: 12, padding: 12, marginBottom: 20, border: 'var(--glass-border)', fontSize: 13, display: 'flex', flexDirection: 'column', gap: '8px' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <span style={{ color: 'var(--text-dim)' }}>N° Téléphone :</span>
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              <span style={{ color: '#fff', fontWeight: 600 }}>{user.phone || 'Non renseigné'}</span>
+              <button 
+                onClick={() => {
+                  navigator.clipboard.writeText(user.phone || '');
+                  ctx.showToast("Téléphone copié !", "success");
+                }}
+                style={{ background: 'rgba(255,255,255,0.08)', border: 'none', color: '#fff', padding: '3px 6px', borderRadius: 4, fontSize: 10, cursor: 'pointer' }}
+              >
+                Copier
+              </button>
+            </div>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <span style={{ color: 'var(--text-dim)' }}>ID Unique (DID) :</span>
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              <span style={{ color: '#fff', fontFamily: 'monospace', fontSize: 11, maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={user.id}>
+                {user.id}
+              </span>
+              <button 
+                onClick={() => {
+                  navigator.clipboard.writeText(user.id || '');
+                  ctx.showToast("ID Unique copié !", "success");
+                }}
+                style={{ background: 'rgba(255,255,255,0.08)', border: 'none', color: '#fff', padding: '3px 6px', borderRadius: 4, fontSize: 10, cursor: 'pointer' }}
+              >
+                Copier
+              </button>
+            </div>
+          </div>
+        </div>
 
         {/* Interests */}
         {user.interests?.length > 0 && (
@@ -1445,8 +1546,9 @@ function ProfileScreen({ ctx }) {
                   const file = e.target.files[0];
                   if (!file) return;
                   const reader = new FileReader();
-                  reader.onload = (ev) => {
-                    ctx.updateProfile({ photos: [...photos, ev.target.result] });
+                  reader.onload = async (ev) => {
+                    const compressed = await compressImage(ev.target.result);
+                    ctx.updateProfile({ photos: [...photos, compressed] });
                   };
                   reader.readAsDataURL(file);
                 }} />
@@ -1607,13 +1709,35 @@ function AddFriendScreen({ ctx }) {
   const myFriends = ctx.friends[myId] || [];
 
   const search = async () => {
-    const cleanPhone = phone.trim().replace(/\s+/g, '').replace(/-/g, '');
-    if (!cleanPhone) return;
+    let input = phone.trim();
+    if (!input) return;
 
-    // Search local users first
+    // Normalize phone number variants for local and Firestore searches
+    const cleanPhone = input.replace(/[\s\-()]/g, '');
+    let formatsToSearch = [input, cleanPhone];
+
+    // Handle French country code formats
+    if (cleanPhone.startsWith('0') && cleanPhone.length === 10) {
+      formatsToSearch.push('+33' + cleanPhone.slice(1));
+    }
+    // Handle Guinea country code formats (e.g. 620 12 34 56 -> +224 620 12 34 56)
+    if (/^6\d{8}$/.test(cleanPhone)) {
+      formatsToSearch.push('+224' + cleanPhone);
+      formatsToSearch.push('+33' + cleanPhone);
+    }
+
+    formatsToSearch = [...new Set(formatsToSearch)];
+
+    // 1. Search local users first
     const foundLocal = Object.values(ctx.users).find((u) => {
-      const uPhone = (u.phone || "").toString().trim().replace(/\s+/g, '').replace(/-/g, '');
-      return uPhone === cleanPhone && u.id !== myId;
+      if (u.id === myId) return false;
+      const uPhoneNormalized = (u.phone || "").toString().replace(/[\s\-()]/g, '');
+      const uNormalizedField = (u.normalizedPhone || "").toString().replace(/[\s\-()]/g, '');
+      
+      return formatsToSearch.some(f => {
+        const cleanF = f.replace(/[\s\-()]/g, '');
+        return uPhoneNormalized === cleanF || uNormalizedField === cleanF;
+      });
     });
 
     if (foundLocal) {
@@ -1621,17 +1745,33 @@ function AddFriendScreen({ ctx }) {
       return;
     }
 
+    // 2. Search Firestore
     try {
       const usersRef = collection(firestore, "users");
-      // Search exact and also normalized
-      const q = query(usersRef, where("phone", "==", phone.trim()));
-      const q2 = query(usersRef, where("phone", "==", cleanPhone));
+      const queries = [];
       
-      const [snap1, snap2] = await Promise.all([getDocs(q), getDocs(q2)]);
+      formatsToSearch.forEach(f => {
+        queries.push(query(usersRef, where("phone", "==", f)));
+        queries.push(query(usersRef, where("normalizedPhone", "==", f)));
+        // Also support searching by exact ID (DID) or Node ID in the same search box
+        queries.push(query(usersRef, where("id", "==", f)));
+        queries.push(query(usersRef, where("nodeId", "==", f)));
+      });
 
-      const docData = !snap1.empty ? snap1.docs[0].data() : (!snap2.empty ? snap2.docs[0].data() : null);
+      const snapshots = await Promise.all(queries.map(q => getDocs(q)));
+      
+      let docData = null;
+      for (const snap of snapshots) {
+        if (!snap.empty) {
+          const firstDoc = snap.docs[0].data();
+          if (firstDoc.id !== myId) {
+            docData = firstDoc;
+            break;
+          }
+        }
+      }
 
-      if (docData && docData.id !== myId) {
+      if (docData) {
         await db.put("users", docData);
         ctx.setUsers((prev) => ({ ...prev, [docData.id]: docData }));
         setResult(docData);
@@ -1647,6 +1787,45 @@ function AddFriendScreen({ ctx }) {
 
   return (
     <Screen title="Ajouter un ami" back={() => ctx.setView(VIEWS.FRIENDS)}>
+      {/* Share credentials section */}
+      <div className="filters-panel" style={{ marginBottom: 16, background: 'rgba(108, 99, 255, 0.05)', border: '1px solid rgba(108, 99, 255, 0.15)', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+        <h4 style={{ margin: '0 0 4px', color: 'var(--primary)', fontFamily: 'Outfit' }}>Partager mes informations</h4>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, fontSize: 13.5 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <span style={{ color: 'var(--text-dim)' }}>📱 Mon Téléphone :</span>
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              <span style={{ fontWeight: 600, color: '#fff' }}>{ctx.currentUser?.phone}</span>
+              <button 
+                onClick={() => {
+                  navigator.clipboard.writeText(ctx.currentUser?.phone || '');
+                  ctx.showToast("Téléphone copié !", "success");
+                }}
+                style={{ background: 'rgba(255,255,255,0.08)', border: 'none', color: '#fff', padding: '4px 8px', borderRadius: 6, fontSize: 11, cursor: 'pointer' }}
+              >
+                Copier
+              </button>
+            </div>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <span style={{ color: 'var(--text-dim)' }}>🔑 Mon ID Unique (DID) :</span>
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              <span style={{ fontWeight: 600, color: '#fff', maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={myId}>
+                {myId}
+              </span>
+              <button 
+                onClick={() => {
+                  navigator.clipboard.writeText(myId || '');
+                  ctx.showToast("ID Unique copié !", "success");
+                }}
+                style={{ background: 'rgba(255,255,255,0.08)', border: 'none', color: '#fff', padding: '4px 8px', borderRadius: 6, fontSize: 11, cursor: 'pointer' }}
+              >
+                Copier
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
         {["phone", "qr"].map((t) => (
           <button
@@ -1697,7 +1876,27 @@ function AddFriendScreen({ ctx }) {
           <div style={{ display: "inline-block", background: "#fff", padding: 12, borderRadius: 16, marginBottom: '8px' }}>
             <QRCanvas data={myQR} size={150} />
           </div>
-          <div style={{ color: "var(--text-dim)", fontSize: 12 }}>Faites scanner ce code par un autre utilisateur.</div>
+          <div style={{ display: 'flex', justifyContent: 'center', gap: 8, marginBottom: 12 }}>
+            <button 
+              onClick={() => {
+                navigator.clipboard.writeText(myQR);
+                ctx.showToast("Lien QR copié !", "success");
+              }}
+              style={{ background: 'var(--primary)', border: 'none', color: '#fff', padding: '6px 12px', borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+            >
+              Copier le lien QR
+            </button>
+            <button 
+              onClick={() => {
+                navigator.clipboard.writeText(myId || '');
+                ctx.showToast("ID Unique copié !", "success");
+              }}
+              style={{ background: '#1c1c2e', border: 'var(--glass-border)', color: '#fff', padding: '6px 12px', borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+            >
+              Copier mon ID
+            </button>
+          </div>
+          <div style={{ color: "var(--text-dim)", fontSize: 12 }}>Faites scanner ce code par un autre utilisateur ou partagez le lien QR / ID.</div>
 
           <div style={{ marginTop: 24, borderTop: "1px solid rgba(255,255,255,0.05)", paddingTop: 16 }}>
             <div style={{ color: "var(--text-dim)", fontSize: 13.5, marginBottom: 12 }}>Simuler le scan d'un ami</div>
@@ -2002,9 +2201,39 @@ function SettingsScreen({ ctx }) {
     <Screen title="Paramètres" back={() => ctx.setView(VIEWS.PROFILE)}>
       <div className="filters-panel" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
         <h3 style={{ margin: 0 }}>Options Réseau P2P</h3>
-        <div className="filter-row">
+        <div className="filter-row" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <span>Identifiant Unique (DID) :</span>
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            <span style={{ fontSize: '0.8rem', color: 'var(--text-dim)', maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={ctx.currentUser?.id}>
+              {ctx.currentUser?.id}
+            </span>
+            <button 
+              onClick={() => {
+                navigator.clipboard.writeText(ctx.currentUser?.id || '');
+                ctx.showToast("ID Unique copié !", "success");
+              }}
+              style={{ background: 'rgba(255,255,255,0.08)', border: 'none', color: '#fff', padding: '4px 8px', borderRadius: 6, fontSize: 11, cursor: 'pointer' }}
+            >
+              Copier
+            </button>
+          </div>
+        </div>
+        <div className="filter-row" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <span>Identifiant Nœud :</span>
-          <span style={{ fontSize: '0.8rem', color: 'var(--text-dim)' }}>{ctx.nodeId || 'Non généré'}</span>
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            <span style={{ fontSize: '0.8rem', color: 'var(--text-dim)', maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={ctx.nodeId}>
+              {ctx.nodeId || 'Non généré'}
+            </span>
+            <button 
+              onClick={() => {
+                navigator.clipboard.writeText(ctx.nodeId || '');
+                ctx.showToast("ID Nœud copié !", "success");
+              }}
+              style={{ background: 'rgba(255,255,255,0.08)', border: 'none', color: '#fff', padding: '4px 8px', borderRadius: 6, fontSize: 11, cursor: 'pointer' }}
+            >
+              Copier
+            </button>
+          </div>
         </div>
         <div className="filter-row">
           <span>Protocole Sync :</span>
