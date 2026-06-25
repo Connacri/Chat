@@ -105,7 +105,8 @@ export class Identity {
       true,
       ['verify']
     );
-    return await verifySignature(publicKey, user.phone, user.proof);
+    const dataToVerify = user.attestation ? `${user.phone}:${user.attestation}` : user.phone;
+    return await verifySignature(publicKey, dataToVerify, user.proof);
   }
 
   // ─── Private helpers ──────────────────────────────────────────────────────
