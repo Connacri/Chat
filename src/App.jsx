@@ -281,15 +281,16 @@ const VIEWS = {
   EDIT_PROFILE: "edit_profile", OTP: "otp",
 };
 
-// Détermination déterministe du numéro de téléphone basé sur l'identifiant unique du nœud de l'appareil (simulation de la carte SIM matérielle)
+// Détermination déterministe du numéro de téléphone basé sur l'identifiant unique du nœud de l'appareil (simulation de la carte SIM matérielle de Guinée)
 const getDetectedPhoneNumber = (nodeId) => {
-  if (!nodeId) return "+33 6 00 00 00 00";
+  if (!nodeId) return "+224 600 00 00 00";
   let hash = 0;
   for (let i = 0; i < nodeId.length; i++) {
     hash = nodeId.charCodeAt(i) + ((hash << 5) - hash);
   }
   const lastDigits = Math.abs(hash % 100000000).toString().padStart(8, '0');
-  return `+33 6 ${lastDigits.slice(0, 2)} ${lastDigits.slice(2, 4)} ${lastDigits.slice(4, 6)} ${lastDigits.slice(6, 8)}`;
+  // Format national guinéen standard (ex: +224 620 12 34 56)
+  return `+224 6${lastDigits.slice(0, 2)} ${lastDigits.slice(2, 4)} ${lastDigits.slice(4, 6)} ${lastDigits.slice(6, 8)}`;
 };
 
 // Compression et redimensionnement d'image pour respecter la limite de taille Firestore (1 Mo)
@@ -526,18 +527,18 @@ export default function App() {
 
   // ── Register / Login ──
   const registerUser = useCallback(async (data) => {
-    const detectedPhone = getDetectedPhoneNumber(nodeId);
+    const phoneToUse = data.phone || getDetectedPhoneNumber(nodeId);
     
     triggerSimDetection(async () => {
       try {
         // 🛡️ ULTRA-SECURE: Generate non-exportable hardware-bound key pair
-        const idData = await identity.create(detectedPhone);
+        const idData = await identity.create(phoneToUse);
 
         const user = {
           id: idData.did,
           name: data.name,
-          phone: detectedPhone,
-          normalizedPhone: detectedPhone.replace(/[\s\-()]/g, ''),
+          phone: phoneToUse,
+          normalizedPhone: phoneToUse.replace(/[\s\-()]/g, ''),
           nodeId: nodeId,
           publicKey: idData.publicKey,
           proof: idData.proof, // Signed phone + challenge
@@ -1111,10 +1112,10 @@ function RegisterScreen({ ctx }) {
   return (
     <Screen title="Créer un compte" subtitle="Rejoignez Nexus via SIM sécurisée">
       <div style={{ background: "rgba(108, 99, 255, 0.05)", border: "var(--glass-border)", borderRadius: 12, padding: 14, marginBottom: 4, fontSize: 13, color: "var(--secondary)" }}>
-        🔒 Votre carte SIM a été identifiée. Le numéro de téléphone ci-dessous sera validé cryptographiquement lors de l'inscription.
+        🔒 Votre carte SIM a été détectée automatiquement. Vous pouvez modifier le numéro de téléphone si celui-ci est incorrect.
       </div>
       <Field label="Nom complet" value={form.name} onChange={set("name")} placeholder="Jean Dupont" />
-      <Field label="Téléphone (Détecté)" value={form.phone} disabled type="tel" />
+      <Field label="Téléphone" value={form.phone} onChange={set("phone")} type="tel" placeholder="+224 600 00 00 00" />
       <Field label="Bio" value={form.bio} onChange={set("bio")} placeholder="Parlez de vous..." />
       <Field label="Âge" value={form.age} onChange={set("age")} placeholder="25" type="number" />
       <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
@@ -1139,18 +1140,37 @@ function RegisterScreen({ ctx }) {
 // ─── Login ───────────────────────────────────────────────────
 function LoginScreen({ ctx }) {
   const detectedPhone = useMemo(() => ctx.getDetectedPhoneNumber(ctx.nodeId), [ctx.nodeId, ctx.getDetectedPhoneNumber]);
+  const [phone, setPhone] = useState(detectedPhone);
+
+  useEffect(() => {
+    setPhone(detectedPhone);
+  }, [detectedPhone]);
+
   const login = async () => {
     ctx.triggerSimDetection(async () => {
-      let user = Object.values(ctx.users).find((u) => u.phone === detectedPhone);
+      const phoneToUse = phone.trim();
+      if (!phoneToUse) return;
+      
+      const cleanPhoneToUse = phoneToUse.replace(/[\s\-()]/g, '');
+
+      let user = Object.values(ctx.users).find((u) => {
+        const uPhoneNormalized = (u.phone || "").replace(/[\s\-()]/g, '');
+        const uNormalizedField = (u.normalizedPhone || "").replace(/[\s\-()]/g, '');
+        return uPhoneNormalized === cleanPhoneToUse || uNormalizedField === cleanPhoneToUse;
+      });
 
       // If not found locally, search Firestore
       if (!user) {
         try {
           const usersRef = collection(firestore, "users");
-          const q = query(usersRef, where("phone", "==", detectedPhone), limit(1));
-          const snap = await getDocs(q);
-          if (!snap.empty) {
-            user = snap.docs[0].data();
+          const q = query(usersRef, where("phone", "==", phoneToUse), limit(1));
+          const q2 = query(usersRef, where("normalizedPhone", "==", cleanPhoneToUse), limit(1));
+          
+          const [snap1, snap2] = await Promise.all([getDocs(q), getDocs(q2)]);
+          const matchedDoc = !snap1.empty ? snap1.docs[0] : (!snap2.empty ? snap2.docs[0] : null);
+          
+          if (matchedDoc) {
+            user = matchedDoc.data();
             await db.put("users", user);
           }
         } catch (e) {
@@ -1170,7 +1190,7 @@ function LoginScreen({ ctx }) {
         ctx.showToast(`Réseau cellulaire vérifié. Connexion établie ✓`, "success");
         ctx.setView(VIEWS.HOME);
       } else {
-        ctx.showToast("Aucun compte associé à cette carte SIM. Veuillez créer un compte.", "error");
+        ctx.showToast("Aucun compte associé à ce numéro de téléphone. Veuillez créer un compte.", "error");
         ctx.setView(VIEWS.REGISTER);
       }
     });
@@ -1178,14 +1198,12 @@ function LoginScreen({ ctx }) {
 
   return (
     <Screen title="Connexion Réseau" subtitle="Connexion sécurisée par carte SIM">
-      <div style={{ background: "rgba(108, 99, 255, 0.08)", border: "var(--glass-border)", borderRadius: 16, padding: 24, marginBottom: 12, textAlign: "center", display: "flex", flexDirection: "column", alignItems: "center" }}>
-        <div style={{ fontSize: 48, marginBottom: 12 }}>📱</div>
-        <div style={{ fontWeight: "700", color: "#fff", fontSize: "1.05rem", marginBottom: 6 }}>SIM Détectée</div>
-        <div style={{ fontSize: "1.2rem", fontWeight: "800", color: "var(--secondary)", letterSpacing: "1px", fontFamily: "monospace" }}>
-          {detectedPhone}
-        </div>
-        <p style={{ fontSize: 12, color: "var(--text-dim)", marginTop: 8, lineHeight: 1.4, maxWidth: 280 }}>
-          Votre numéro de téléphone est détecté automatiquement via le réseau mobile pour une authentification cryptographique matérielle anti-fraude.
+      <div style={{ background: "rgba(108, 99, 255, 0.08)", border: "var(--glass-border)", borderRadius: 16, padding: 20, marginBottom: 12, textAlign: "center", display: "flex", flexDirection: "column", alignItems: "stretch" }}>
+        <div style={{ fontSize: 40, marginBottom: 8 }}>📱</div>
+        <div style={{ fontWeight: "700", color: "#fff", fontSize: "1rem", marginBottom: 6 }}>SIM Détectée</div>
+        <Field label="Numéro de téléphone" value={phone} onChange={(e) => setPhone(e.target.value)} type="tel" placeholder="+224 600 00 00 00" />
+        <p style={{ fontSize: 11.5, color: "var(--text-dim)", marginTop: 8, lineHeight: 1.4 }}>
+          Votre numéro de téléphone est détecté automatiquement, mais vous pouvez le modifier s'il est incorrect.
         </p>
       </div>
 
@@ -1850,7 +1868,7 @@ function AddFriendScreen({ ctx }) {
 
       {tab === "phone" && (
         <div className="filters-panel">
-          <Field label="Numéro de téléphone" value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="+33 6 00 00 00 00" type="tel" />
+          <Field label="Numéro de téléphone" value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="+224 600 00 00 00" type="tel" />
           <Btn label="Rechercher" onClick={search} full />
           {result === "not_found" && <div style={{ color: "var(--accent)", textAlign: "center", marginTop: 12, fontSize: 13.5 }}>Aucun utilisateur trouvé</div>}
           {result && result !== "not_found" && (
