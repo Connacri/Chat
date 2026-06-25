@@ -938,25 +938,33 @@ function Field({ label, value, onChange, placeholder, type = 'text', disabled })
   );
 }
 
-function Btn({ label, onClick, full, secondary, style }) {
+function Btn({ label, onClick, full, secondary, style, disabled, ...props }) {
   let bg = 'linear-gradient(135deg, var(--primary), var(--secondary))';
   if (secondary) {
     bg = '#27273a';
   }
+  if (disabled) {
+    bg = '#333';
+  }
   return (
     <button
       onClick={onClick}
+      disabled={disabled}
+      aria-label={props['aria-label'] || label}
       style={{
         width: full ? '100%' : 'auto',
         background: bg,
         border: secondary ? '1px solid rgba(255,255,255,0.1)' : 'none',
-        color: '#fff',
+        color: disabled ? '#777' : '#fff',
         padding: '12px 20px',
         borderRadius: '12px',
         fontWeight: 'bold',
-        cursor: 'pointer',
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        opacity: disabled ? 0.6 : 1,
+        transition: 'all 0.2s ease',
         ...style
       }}
+      {...props}
     >
       {label}
     </button>
@@ -1482,6 +1490,8 @@ function ChatScreen({ ctx, isGroup }) {
         <button
           style={{ background: recording ? "var(--accent)" : "var(--primary)" }}
           onClick={recording ? stopRecord : (input.trim() ? send : startRecord)}
+          aria-label={recording ? "Arrêter l'enregistrement" : input.trim() ? "Envoyer le message" : "Enregistrer un message vocal"}
+          title={recording ? "Arrêter l'enregistrement" : input.trim() ? "Envoyer le message" : "Enregistrer un message vocal"}
         >
           {recording ? "⏹" : input.trim() ? "➤" : "🎤"}
         </button>
@@ -1562,7 +1572,7 @@ function ProfileScreen({ ctx }) {
             <span style={{ color: 'var(--text-dim)' }}>N° Téléphone :</span>
             <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
               <span style={{ color: '#fff', fontWeight: 600 }}>{user.phone || 'Non renseigné'}</span>
-              <button 
+              <button aria-label="Téléphone copié !" title="Téléphone copié !"
                 onClick={() => {
                   navigator.clipboard.writeText(user.phone || '');
                   ctx.showToast("Téléphone copié !", "success");
@@ -1579,7 +1589,7 @@ function ProfileScreen({ ctx }) {
               <span style={{ color: '#fff', fontFamily: 'monospace', fontSize: 11, maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={user.id}>
                 {user.id}
               </span>
-              <button 
+              <button aria-label="ID Unique copié !" title="ID Unique copié !"
                 onClick={() => {
                   navigator.clipboard.writeText(user.id || '');
                   ctx.showToast("ID Unique copié !", "success");
@@ -1882,7 +1892,7 @@ function AddFriendScreen({ ctx }) {
             <span style={{ color: 'var(--text-dim)' }}>📱 Mon Téléphone :</span>
             <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
               <span style={{ fontWeight: 600, color: '#fff' }}>{ctx.currentUser?.phone}</span>
-              <button 
+              <button aria-label="Téléphone copié !" title="Téléphone copié !"
                 onClick={() => {
                   navigator.clipboard.writeText(ctx.currentUser?.phone || '');
                   ctx.showToast("Téléphone copié !", "success");
@@ -1899,7 +1909,7 @@ function AddFriendScreen({ ctx }) {
               <span style={{ fontWeight: 600, color: '#fff', maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={myId}>
                 {myId}
               </span>
-              <button 
+              <button aria-label="ID Unique copié !" title="ID Unique copié !"
                 onClick={() => {
                   navigator.clipboard.writeText(myId || '');
                   ctx.showToast("ID Unique copié !", "success");
@@ -1964,7 +1974,7 @@ function AddFriendScreen({ ctx }) {
             <QRCanvas data={myQR} size={150} />
           </div>
           <div style={{ display: 'flex', justifyContent: 'center', gap: 8, marginBottom: 12 }}>
-            <button 
+            <button aria-label="Lien QR copié !" title="Lien QR copié !"
               onClick={() => {
                 navigator.clipboard.writeText(myQR);
                 ctx.showToast("Lien QR copié !", "success");
@@ -1973,7 +1983,7 @@ function AddFriendScreen({ ctx }) {
             >
               Copier le lien QR
             </button>
-            <button 
+            <button aria-label="ID Unique copié !" title="ID Unique copié !"
               onClick={() => {
                 navigator.clipboard.writeText(myId || '');
                 ctx.showToast("ID Unique copié !", "success");
@@ -2215,6 +2225,7 @@ function DiscoverScreen({ ctx }) {
                       className="slider-arrow"
                       onClick={() => setPhotoIndex(prev => Math.max(0, prev - 1))}
                       disabled={photoIndex === 0}
+                      aria-label="Photo précédente"
                     >
                       ◀
                     </button>
@@ -2222,6 +2233,7 @@ function DiscoverScreen({ ctx }) {
                       className="slider-arrow"
                       onClick={() => setPhotoIndex(prev => Math.min((activeProfile.photos.length - 1), prev + 1))}
                       disabled={photoIndex === activeProfile.photos.length - 1}
+                      aria-label="Photo suivante"
                     >
                       ▶
                     </button>
@@ -2248,10 +2260,10 @@ function DiscoverScreen({ ctx }) {
 
               {/* Like / Pass Actions */}
               <div className="tinder-actions">
-                <button className="tinder-btn pass" onClick={handlePass}>
+                <button className="tinder-btn pass" onClick={handlePass} aria-label="Passer">
                   ✖
                 </button>
-                <button className="tinder-btn like" onClick={handleLike}>
+                <button className="tinder-btn like" onClick={handleLike} aria-label="Aimer">
                   ❤️
                 </button>
               </div>
@@ -2294,7 +2306,7 @@ function SettingsScreen({ ctx }) {
             <span style={{ fontSize: '0.8rem', color: 'var(--text-dim)', maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={ctx.currentUser?.id}>
               {ctx.currentUser?.id}
             </span>
-            <button 
+            <button aria-label="ID Unique copié !" title="ID Unique copié !"
               onClick={() => {
                 navigator.clipboard.writeText(ctx.currentUser?.id || '');
                 ctx.showToast("ID Unique copié !", "success");
@@ -2311,7 +2323,7 @@ function SettingsScreen({ ctx }) {
             <span style={{ fontSize: '0.8rem', color: 'var(--text-dim)', maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={ctx.nodeId}>
               {ctx.nodeId || 'Non généré'}
             </span>
-            <button 
+            <button aria-label="ID Nœud copié !" title="ID Nœud copié !"
               onClick={() => {
                 navigator.clipboard.writeText(ctx.nodeId || '');
                 ctx.showToast("ID Nœud copié !", "success");
