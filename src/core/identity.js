@@ -1,38 +1,74 @@
 /**
  * Identity Layer - Decentralized Identifiers (DID)
- * Linked to phone number via Ed25519 signatures
+ * Linked to phone number via Web Crypto signatures
  * Key pair is persisted in IndexedDB to survive page reloads.
  */
-import { verifySignature } from '../utils/crypto_utils.js';
 
 /** Convert ArrayBuffer to base64 string */
 const bufToB64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const b64ToBuf = (b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)).buffer;
+const bufToHex = (buf) => Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
+const hexToBuf = (hex) => new Uint8Array(hex.match(/.{1,2}/g).map((byte) => parseInt(byte, 16)));
+
+const SIGNING_ALGORITHMS = {
+  Ed25519: {
+    generate: { name: 'Ed25519' },
+    import: { name: 'Ed25519' },
+    sign: { name: 'Ed25519' },
+  },
+  'ECDSA-P256': {
+    generate: { name: 'ECDSA', namedCurve: 'P-256' },
+    import: { name: 'ECDSA', namedCurve: 'P-256' },
+    sign: { name: 'ECDSA', hash: 'SHA-256' },
+  },
+};
+
+const inferAlgorithm = (user) => {
+  if (user?.keyAlgorithm && SIGNING_ALGORITHMS[user.keyAlgorithm]) return user.keyAlgorithm;
+  return user?.publicKey?.length === 130 ? 'ECDSA-P256' : 'Ed25519';
+};
+
+const createSigningKeyPair = async () => {
+  const attempts = ['Ed25519', 'ECDSA-P256'];
+  let lastError;
+
+  for (const keyAlgorithm of attempts) {
+    const algorithm = SIGNING_ALGORITHMS[keyAlgorithm];
+    try {
+      const keyPair = await crypto.subtle.generateKey(
+        algorithm.generate,
+        true,
+        ['sign', 'verify']
+      );
+      return { keyAlgorithm, keyPair, algorithm };
+    } catch (error) {
+      lastError = error;
+      console.warn(`[Identity] ${keyAlgorithm} unavailable, trying fallback.`, error);
+    }
+  }
+
+  throw lastError || new Error('No supported signing algorithm available.');
+};
 
 export class Identity {
   constructor() {
     this.keyPair = null;
     this.did = null;
     this.phone = null;
+    this.keyAlgorithm = null;
   }
 
   /**
    * Create a new hardware-bound identity.
    */
   async create(phone) {
-    // Generate a non-exportable key pair (locked to this device/browser)
-    this.keyPair = await crypto.subtle.generateKey(
-      {
-        name: 'Ed25519',
-      },
-      false, // NOT extractable
-      ['sign', 'verify']
-    );
+    const { keyAlgorithm, keyPair, algorithm } = await createSigningKeyPair();
+    this.keyPair = keyPair;
+    this.keyAlgorithm = keyAlgorithm;
 
     // Export public key (raw) for DID
     const pubKeyBuffer = await crypto.subtle.exportKey('raw', this.keyPair.publicKey);
-    const pubKeyHex = Array.from(new Uint8Array(pubKeyBuffer))
-      .map((b) => b.toString(16).padStart(2, '0'))
-      .join('');
+    const pubKeyHex = bufToHex(pubKeyBuffer);
 
     this.did = `did:nexus:key:${pubKeyHex}`;
     this.phone = phone;
@@ -42,24 +78,25 @@ export class Identity {
     const challengeHex = Array.from(challenge).map(b => b.toString(16).padStart(2, '0')).join('');
 
     const dataToSign = new TextEncoder().encode(`${phone}:${challengeHex}`);
-    const proofBuffer = await crypto.subtle.sign('Ed25519', this.keyPair.privateKey, dataToSign);
+    const proofBuffer = await crypto.subtle.sign(algorithm.sign, this.keyPair.privateKey, dataToSign);
     const proof = bufToB64(proofBuffer);
 
-    await this._saveHardwareKey(pubKeyHex, this.keyPair.privateKey, phone, proof, challengeHex);
+    await this._saveHardwareKey(pubKeyHex, this.keyPair.privateKey, phone, proof, challengeHex, keyAlgorithm);
 
     return {
       did: this.did,
       phone: this.phone,
       publicKey: pubKeyHex,
+      keyAlgorithm,
       proof,
       attestation: challengeHex
     };
   }
 
-  async _saveHardwareKey(pubKeyHex, privateKey, phone, proof, challenge) {
+  async _saveHardwareKey(pubKeyHex, privateKey, phone, proof, challenge, keyAlgorithm) {
     const store = await this._getStore('readwrite');
     return new Promise((res, rej) => {
-      const req = store.put({ id: 'main', pubKeyHex, privateKey, phone, proof, challenge });
+      const req = store.put({ id: 'main', pubKeyHex, privateKey, phone, proof, challenge, keyAlgorithm });
       req.onsuccess = res;
       req.onerror = rej;
     });
@@ -70,20 +107,23 @@ export class Identity {
     if (!stored) return null;
 
     try {
+      const keyAlgorithm = inferAlgorithm({ publicKey: stored.pubKeyHex, keyAlgorithm: stored.keyAlgorithm });
+      const algorithm = SIGNING_ALGORITHMS[keyAlgorithm];
       this.keyPair = {
         privateKey: stored.privateKey,
         publicKey: await crypto.subtle.importKey(
           'raw',
-          new Uint8Array(stored.pubKeyHex.match(/.{1,2}/g).map(b => parseInt(b, 16))),
-          { name: 'Ed25519' },
+          hexToBuf(stored.pubKeyHex),
+          algorithm.import,
           true,
           ['verify']
         )
       };
       this.did = `did:nexus:key:${stored.pubKeyHex}`;
       this.phone = stored.phone;
+      this.keyAlgorithm = keyAlgorithm;
 
-      return { did: this.did, phone: stored.phone, publicKey: stored.pubKeyHex, proof: stored.proof };
+      return { did: this.did, phone: stored.phone, publicKey: stored.pubKeyHex, keyAlgorithm, proof: stored.proof };
     } catch (e) {
       console.error("Failed to restore identity", e);
       return null;
@@ -92,18 +132,19 @@ export class Identity {
 
   async verifyOwnership(user) {
     try {
-      const pubKeyBuffer = new Uint8Array(
-        user.publicKey.match(/.{1,2}/g).map((byte) => parseInt(byte, 16))
-      );
+      const keyAlgorithm = inferAlgorithm(user);
+      const algorithm = SIGNING_ALGORITHMS[keyAlgorithm];
+      const pubKeyBuffer = hexToBuf(user.publicKey);
       const publicKey = await crypto.subtle.importKey(
         'raw',
         pubKeyBuffer,
-        { name: 'Ed25519' },
+        algorithm.import,
         true,
         ['verify']
       );
       const dataToVerify = user.attestation ? `${user.phone}:${user.attestation}` : user.phone;
-      return await verifySignature(publicKey, dataToVerify, user.proof);
+      const data = new TextEncoder().encode(dataToVerify);
+      return await crypto.subtle.verify(algorithm.sign, publicKey, b64ToBuf(user.proof), data);
     } catch (e) {
       console.error("Ownership verification failed", e);
       return false;
