@@ -14,27 +14,29 @@ export class SearchIndex {
   }
 
   update(user) {
+    if (!user || !user.id) return;
     // Indexing fields for quick search
     this.index.set(user.id, {
-      name: user.name?.toLowerCase(),
-      city: user.city?.toLowerCase(),
-      age: user.age,
+      name: user.name?.toLowerCase() || "",
+      city: user.city?.toLowerCase() || "",
+      age: user.age || 0,
       interests: user.interests?.map(i => i.toLowerCase()) || [],
-      verified: user.verified,
-      profession: user.profession?.toLowerCase(),
-      did: user.id
+      verified: !!user.verified,
+      profession: user.profession?.toLowerCase() || "",
+      did: user.id,
+      phone: user.phone || ""
     });
   }
 
   search(filters) {
     return Array.from(this.index.values()).filter(u => {
-      // BUG 5: guard against null/undefined name or city before calling .includes()
       if (filters.name && !(u.name && u.name.includes(filters.name.toLowerCase()))) return false;
       if (filters.city && !(u.city && u.city.includes(filters.city.toLowerCase()))) return false;
       if (filters.minAge && u.age < filters.minAge) return false;
       if (filters.maxAge && u.age > filters.maxAge) return false;
       if (filters.verified !== undefined && u.verified !== filters.verified) return false;
       if (filters.interest && !u.interests.some(i => i.includes(filters.interest.toLowerCase()))) return false;
+      if (filters.phone && !u.phone.includes(filters.phone)) return false;
       return true;
     });
   }

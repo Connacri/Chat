@@ -1,6 +1,7 @@
 import { db } from './db.js';
 import { CRDT } from './crdt.js';
 import { P2PNetwork } from './network.js';
+import { searchIndex } from './search.js';
 
 export class Nexus {
   constructor() {
@@ -14,6 +15,7 @@ export class Nexus {
   async init(nodeId) {
     await this.db.ready;
     this.network = new P2PNetwork(nodeId, this.handleSync.bind(this));
+    await searchIndex.build();
     return this;
   }
 
@@ -34,13 +36,11 @@ export class Nexus {
     // 1. Sync Users
     if (delta.users) {
       const localUsers = await this.db.getAll('users');
-      const localUsersMap = new Map(localUsers.map(u => [u.id, u]));
-      for (const [id, rUser] of Object.entries(delta.users)) {
-        const lUser = localUsersMap.get(id);
-        if (!lUser || (rUser && rUser.ts > (lUser.ts || 0))) {
-          await this.db.put('users', rUser);
-          localUsersMap.set(id, rUser); // Update local map for consistency if multiple users in delta
-        }
+      const localUsersMap = Object.fromEntries(localUsers.map(u => [u.id, u]));
+      const merged = this.crdt.mergeObjects(localUsersMap, delta.users);
+      for (const user of Object.values(merged)) {
+        await this.db.put('users', user);
+        searchIndex.update(user);
       }
     }
 

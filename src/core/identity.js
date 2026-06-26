@@ -3,14 +3,10 @@
  * Linked to phone number via Ed25519 signatures
  * Key pair is persisted in IndexedDB to survive page reloads.
  */
-import { generateKeyPair, signMessage, verifySignature } from '../utils/crypto_utils.js';
+import { verifySignature } from '../utils/crypto_utils.js';
 
 /** Convert ArrayBuffer to base64 string */
 const bufToB64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
-
-/** Convert base64 string back to ArrayBuffer */
-const b64ToBuf = (b64) =>
-  Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)).buffer;
 
 export class Identity {
   constructor() {
@@ -21,7 +17,6 @@ export class Identity {
 
   /**
    * Create a new hardware-bound identity.
-   * Uses WebAuthn-inspired hardware signing if available, or non-exportable SubtleCrypto keys.
    */
   async create(phone) {
     // Generate a non-exportable key pair (locked to this device/browser)
@@ -29,7 +24,7 @@ export class Identity {
       {
         name: 'Ed25519',
       },
-      false, // NOT extractable - This is the "Ultra Secure" part
+      false, // NOT extractable
       ['sign', 'verify']
     );
 
@@ -50,9 +45,6 @@ export class Identity {
     const proofBuffer = await crypto.subtle.sign('Ed25519', this.keyPair.privateKey, dataToSign);
     const proof = bufToB64(proofBuffer);
 
-    // --- Persist public part + internal reference ---
-    // Note: We can't export the private key, so we store the reference in 'keypair' store
-    // which IndexedDB handles by keeping the CryptoKey object itself.
     await this._saveHardwareKey(pubKeyHex, this.keyPair.privateKey, phone, proof, challengeHex);
 
     return {
@@ -60,14 +52,13 @@ export class Identity {
       phone: this.phone,
       publicKey: pubKeyHex,
       proof,
-      attestation: challengeHex // Proof of hardware binding
+      attestation: challengeHex
     };
   }
 
   async _saveHardwareKey(pubKeyHex, privateKey, phone, proof, challenge) {
     const store = await this._getStore('readwrite');
     return new Promise((res, rej) => {
-      // Storing the actual CryptoKey object (non-exportable keys can be stored in IDB)
       const req = store.put({ id: 'main', pubKeyHex, privateKey, phone, proof, challenge });
       req.onsuccess = res;
       req.onerror = rej;
@@ -78,44 +69,55 @@ export class Identity {
     const stored = await this._loadKeyPair();
     if (!stored) return null;
 
-    this.keyPair = {
-      privateKey: stored.privateKey, // This is the non-exportable CryptoKey
-      publicKey: await crypto.subtle.importKey(
-        'raw',
-        new Uint8Array(stored.pubKeyHex.match(/.{1,2}/g).map(b => parseInt(b, 16))),
-        { name: 'Ed25519' },
-        true,
-        ['verify']
-      )
-    };
-    this.did = `did:nexus:key:${stored.pubKeyHex}`;
-    this.phone = stored.phone;
+    try {
+      this.keyPair = {
+        privateKey: stored.privateKey,
+        publicKey: await crypto.subtle.importKey(
+          'raw',
+          new Uint8Array(stored.pubKeyHex.match(/.{1,2}/g).map(b => parseInt(b, 16))),
+          { name: 'Ed25519' },
+          true,
+          ['verify']
+        )
+      };
+      this.did = `did:nexus:key:${stored.pubKeyHex}`;
+      this.phone = stored.phone;
 
-    return { did: this.did, phone: stored.phone, publicKey: stored.pubKeyHex, proof: stored.proof };
+      return { did: this.did, phone: stored.phone, publicKey: stored.pubKeyHex, proof: stored.proof };
+    } catch (e) {
+      console.error("Failed to restore identity", e);
+      return null;
+    }
   }
 
   async verifyOwnership(user) {
-    const pubKeyBuffer = new Uint8Array(
-      user.publicKey.match(/.{1,2}/g).map((byte) => parseInt(byte, 16))
-    );
-    const publicKey = await crypto.subtle.importKey(
-      'raw',
-      pubKeyBuffer,
-      { name: 'Ed25519' },
-      true,
-      ['verify']
-    );
-    const dataToVerify = user.attestation ? `${user.phone}:${user.attestation}` : user.phone;
-    return await verifySignature(publicKey, dataToVerify, user.proof);
+    try {
+      const pubKeyBuffer = new Uint8Array(
+        user.publicKey.match(/.{1,2}/g).map((byte) => parseInt(byte, 16))
+      );
+      const publicKey = await crypto.subtle.importKey(
+        'raw',
+        pubKeyBuffer,
+        { name: 'Ed25519' },
+        true,
+        ['verify']
+      );
+      const dataToVerify = user.attestation ? `${user.phone}:${user.attestation}` : user.phone;
+      return await verifySignature(publicKey, dataToVerify, user.proof);
+    } catch (e) {
+      console.error("Ownership verification failed", e);
+      return false;
+    }
   }
-
-  // ─── Private helpers ──────────────────────────────────────────────────────
 
   _getStore(mode) {
     return new Promise((res, rej) => {
       const req = indexedDB.open('nexus_identity_v1', 1);
       req.onupgradeneeded = (e) => {
-        e.target.result.createObjectStore('keypair', { keyPath: 'id' });
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains('keypair')) {
+          db.createObjectStore('keypair', { keyPath: 'id' });
+        }
       };
       req.onsuccess = (e) => {
         const tx = e.target.result.transaction('keypair', mode);
@@ -125,24 +127,18 @@ export class Identity {
     });
   }
 
-  async _saveKeyPair(pubKeyHex, privKeyB64, phone, proof) {
-    const store = await this._getStore('readwrite');
-    return new Promise((res, rej) => {
-      const req = store.put({ id: 'main', pubKeyHex, privKeyB64, phone, proof });
-      req.onsuccess = res;
-      req.onerror = rej;
-    });
-  }
-
   async _loadKeyPair() {
-    const store = await this._getStore('readonly');
-    return new Promise((res, rej) => {
-      const req = store.get('main');
-      req.onsuccess = () => res(req.result || null);
-      req.onerror = rej;
-    });
+    try {
+      const store = await this._getStore('readonly');
+      return new Promise((res, rej) => {
+        const req = store.get('main');
+        req.onsuccess = () => res(req.result || null);
+        req.onerror = rej;
+      });
+    } catch (e) {
+      return null;
+    }
   }
 }
 
 export const identity = new Identity();
-

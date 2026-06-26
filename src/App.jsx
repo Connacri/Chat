@@ -1,11 +1,14 @@
+import { nexus } from './core/nexus.js';
+import { searchIndex } from './core/search.js';
+import { security } from './core/security.js';
 // ============================================================
 // NEXUS CHAT — Distributed P2P Chat (No Server, No Third Party)
 // CRDTs + WebRTC + IndexedDB + BroadcastChannel + Simulated OTP
 // ============================================================
 import "./index.css";
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { firestore } from "./core/firebase";
-import { identity } from "./core/identity";
+import { firestore } from "./core/firebase.js";
+import { identity } from "./core/identity.js";
 import { collection, query, where, getDocs, limit, doc, setDoc, onSnapshot, getDoc } from "firebase/firestore";
 /////
 // ─── CRDT Engine ────────────────────────────────────────────
@@ -32,256 +35,9 @@ const CRDT = {
     return [...map.values()].sort((a, b) => a.ts - b.ts);
   },
 };
+import { db } from "./core/db.js";
 
 // ─── IndexedDB Store ─────────────────────────────────────────
-class NexusDB {
-  constructor() {
-    this.db = null;
-    this.memoryStore = { users: {}, messages: {}, groups: {}, friends: {}, state: {} };
-    this.ready = this._open();
-  }
-
-  _open() {
-    return new Promise((res) => {
-      if (typeof indexedDB === "undefined") {
-        console.warn("IndexedDB is not supported in this environment. Falling back to in-memory storage.");
-        res();
-        return;
-      }
-      try {
-        const req = indexedDB.open("nexus_chat_v4", 1);
-        req.onupgradeneeded = (e) => {
-          const db = e.target.result;
-          ["users", "messages", "groups", "friends", "state"].forEach((s) => {
-            if (!db.objectStoreNames.contains(s))
-              db.createObjectStore(s, { keyPath: "id" });
-          });
-        };
-        req.onsuccess = (e) => {
-          this.db = e.target.result;
-          res();
-        };
-        req.onerror = (err) => {
-          console.warn("IndexedDB open error, falling back to in-memory storage:", err);
-          res();
-        };
-      } catch (e) {
-        console.warn("IndexedDB open exception, falling back to in-memory storage:", e);
-        res();
-      }
-    });
-  }
-
-  async get(store, id) {
-    await this.ready;
-    if (!this.db) {
-      return this.memoryStore[store]?.[id] || null;
-    }
-    return new Promise((res) => {
-      try {
-        const tx = this.db.transaction(store, "readonly");
-        const req = tx.objectStore(store).get(id);
-        req.onsuccess = () => res(req.result || null);
-        req.onerror = () => res(null);
-      } catch (e) {
-        console.warn(`IndexedDB get error for ${store}/${id}:`, e);
-        res(this.memoryStore[store]?.[id] || null);
-      }
-    });
-  }
-
-  async getAll(store) {
-    await this.ready;
-    if (!this.db) {
-      return Object.values(this.memoryStore[store] || {});
-    }
-    return new Promise((res) => {
-      try {
-        const tx = this.db.transaction(store, "readonly");
-        const req = tx.objectStore(store).getAll();
-        req.onsuccess = () => res(req.result || []);
-        req.onerror = () => res([]);
-      } catch (e) {
-        console.warn(`IndexedDB getAll error for ${store}:`, e);
-        res(Object.values(this.memoryStore[store] || {}));
-      }
-    });
-  }
-
-  async put(store, obj) {
-    await this.ready;
-    if (!this.db) {
-      if (obj && obj.id) {
-        if (!this.memoryStore[store]) this.memoryStore[store] = {};
-        this.memoryStore[store][obj.id] = obj;
-      }
-      return;
-    }
-    return new Promise((res) => {
-      try {
-        const tx = this.db.transaction(store, "readwrite");
-        const req = tx.objectStore(store).put(obj);
-        req.onsuccess = () => res();
-        req.onerror = () => {
-          if (obj && obj.id) {
-            if (!this.memoryStore[store]) this.memoryStore[store] = {};
-            this.memoryStore[store][obj.id] = obj;
-          }
-          res();
-        };
-      } catch (e) {
-        console.warn(`IndexedDB put error for ${store}:`, e);
-        if (obj && obj.id) {
-          if (!this.memoryStore[store]) this.memoryStore[store] = {};
-          this.memoryStore[store][obj.id] = obj;
-        }
-        res();
-      }
-    });
-  }
-
-  async clear(store) {
-    await this.ready;
-    if (!this.db) {
-      this.memoryStore[store] = {};
-      return;
-    }
-    return new Promise((res) => {
-      try {
-        const tx = this.db.transaction(store, "readwrite");
-        const req = tx.objectStore(store).clear();
-        req.onsuccess = () => res();
-        req.onerror = () => {
-          this.memoryStore[store] = {};
-          res();
-        };
-      } catch (e) {
-        console.warn(`IndexedDB clear error for ${store}:`, e);
-        this.memoryStore[store] = {};
-        res();
-      }
-    });
-  }
-}
-
-const db = new NexusDB();
-
-import { WebRTCP2P } from "./core/webrtc";
-
-// ─── P2P Sync via WebRTC + BroadcastChannel ──
-class P2PSync {
-  constructor(nodeId, onSync) {
-    this.nodeId = nodeId;
-    this.onSync = onSync;
-    this.channel = new BroadcastChannel("nexus_p2p_v4");
-    this.rtc = new WebRTCP2P(nodeId, (payload, from) => this.onSync(payload, from));
-    this.peers = new Set();
-    this.online = true;
-    this.pendingQueue = [];
-
-    this.channel.onmessage = (e) => {
-      const { from, type, payload } = e.data;
-      if (from === this.nodeId) return;
-      this.peers.add(from);
-      if (type === "HELLO") this._sendTo("HELLO_ACK", {}, from);
-      if (type === "HELLO_ACK") this.peers.add(from);
-      if (type === "SYNC" || type === "HELLO_ACK") this.onSync(payload, from);
-    };
-
-    // Announce presence via Firestore for inter-device discovery
-    this._announcePresence();
-
-    // Periodic presence announcement
-    this. _presenceInterval = setInterval(() => {
-      if (this.online) this._announcePresence();
-    }, 20000);
-
-    // Periodic sync every 3s
-    this._interval = setInterval(() => {
-      if (this.online) this._flushQueue();
-    }, 3000);
-  }
-
-  async _announcePresence() {
-    try {
-      // Announce existence in Firestore
-      await setDoc(doc(firestore, "presence", this.nodeId), {
-        id: this.nodeId,
-        ts: Date.now(),
-        online: true
-      });
-
-      // Discovery: find other online nodes and try connecting via WebRTC
-      // Filter out nodes that haven't updated in the last 2 minutes to avoid dead connections
-      const twoMinutesAgo = Date.now() - 120000;
-      const q = query(
-        collection(firestore, "presence"),
-        where("online", "==", true),
-        where("ts", ">", twoMinutesAgo),
-        limit(20)
-      );
-
-      const snap = await getDocs(q);
-      snap.forEach(doc => {
-        if (doc.id !== this.nodeId) {
-          this.rtc.connectToPeer(doc.id);
-        }
-      });
-    } catch (e) {
-      console.warn("Presence announcement failed", e);
-    }
-  }
-
-  _broadcast(type, payload) {
-    const data = { from: this.nodeId, type, payload };
-    this.channel.postMessage(data);
-    // Also push to WebRTC peers
-    this.rtc.peers.forEach((pc, peerId) => {
-      this.rtc.sendToPeer(peerId, data);
-    });
-  }
-
-  _sendTo(type, payload, _to) {
-    const data = { from: this.nodeId, type, payload, to: _to };
-    this.channel.postMessage(data);
-    this.rtc.sendToPeer(_to, data);
-  }
-
-  push(delta) {
-    if (this.online) {
-      this._broadcast("SYNC", delta);
-    } else {
-      this.pendingQueue.push(delta);
-    }
-  }
-
-  _flushQueue() {
-    if (this.pendingQueue.length > 0) {
-      this.pendingQueue.forEach((d) => this._broadcast("SYNC", d));
-      this.pendingQueue = [];
-    }
-  }
-
-  goOffline() {
-    this.online = false;
-    setDoc(doc(firestore, "presence", this.nodeId), { online: false }, { merge: true });
-  }
-
-  goOnline() {
-    this.online = true;
-    this._flushQueue();
-    this._announcePresence();
-  }
-
-  destroy() {
-    clearInterval(this._interval);
-    clearInterval(this._presenceInterval);
-    this.channel.close();
-    setDoc(doc(firestore, "presence", this.nodeId), { online: false }, { merge: true });
-  }
-}
-
-// ─── QR Code Generator (pure canvas, no lib) ────────────────
 function QRCanvas({ data, size = 120 }) {
   const ref = useRef();
   useEffect(() => {
@@ -463,7 +219,7 @@ export default function App() {
           db.getAll("messages"),
           db.getAll("groups"),
           db.getAll("friends"),
-          db.get("state", "app"),
+          db.get("metadata", "currentUser"),
         ]);
 
       const usersMap = {};
@@ -485,8 +241,8 @@ export default function App() {
       storedFriends.forEach((f) => (fMap[f.id] = f.list || []));
       setFriends(fMap);
 
-      if (storedState?.userId) {
-        const user = usersMap[storedState.userId];
+      if (storedState?.id) {
+        const user = storedState;
         if (user) { setCurrentUser(user); setView(VIEWS.HOME); }
         else setView(VIEWS.REGISTER);
       } else {
@@ -495,82 +251,37 @@ export default function App() {
     })();
   }, []);
 
-  // ── Sync users from Firestore ──
-  useEffect(() => {
-    if (!currentUser) return;
-    const usersRef = collection(firestore, "users");
-    const q = query(usersRef, limit(100)); // Increased limit
 
-    // Use onSnapshot for real-time updates and discovery
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const fetchedUsers = {};
-      let needsOwnUpdate = false;
-      
-      snapshot.forEach((doc) => {
-        const u = doc.data();
-        fetchedUsers[u.id] = u;
-        db.put("users", u); // Keep local DB in sync
-        
-        // If our own profile in Firestore is missing normalizedPhone or nodeId, flag it for auto-update
-        if (u.id === currentUser.id && (!u.normalizedPhone || !u.nodeId)) {
-          needsOwnUpdate = true;
-        }
-      });
-
-      setUsers((prev) => {
-        return { ...prev, ...fetchedUsers };
-      });
-
-      if (needsOwnUpdate) {
-        console.log("[Migration] Auto-updating own profile in Firestore with normalizedPhone and nodeId...");
-        updateProfile({});
-      }
-    }, (error) => {
-      console.error("Firestore snapshot error:", error);
-    });
-
-    return () => unsubscribe();
-  }, [currentUser, nodeId, updateProfile]);
 
   // ── P2P init ──
   useEffect(() => {
     if (!currentUser) return;
-    const sync = new P2PSync(nodeId, async (delta, from) => {
-      if (delta.users) {
-        setUsers((prev) => {
-          const merged = CRDT.merge(prev, delta.users);
-          Object.values(merged).forEach((u) => db.put("users", u));
-          return merged;
-        });
-      }
-      if (delta.messages) {
-        setMessages((prev) => {
-          const next = { ...prev };
-          for (const [chatId, msgs] of Object.entries(delta.messages)) {
-            next[chatId] = CRDT.mergeLogs(prev[chatId] || [], msgs);
-            next[chatId].forEach((m) => db.put("messages", m));
-          }
-          return next;
-        });
-      }
-      if (delta.groups) {
-        setGroups((prev) => {
-          const merged = { ...prev, ...delta.groups };
-          Object.values(delta.groups).forEach((g) => db.put("groups", g));
-          return merged;
-        });
-      }
-      if (delta.friends) {
-        setFriends((prev) => {
-          const merged = { ...prev, ...delta.friends };
-          Object.entries(delta.friends).forEach(([uid, list]) =>
-            db.put("friends", { id: uid, list })
-          );
-          return merged;
-        });
-      }
-    });
-    setP2p(sync);
+
+    let sync;
+    (async () => {
+      await nexus.init(nodeId);
+      sync = nexus.subscribeToSync(async (delta) => {
+        if (delta.users) {
+          setUsers((prev) => {
+            const next = { ...prev, ...delta.users };
+            return next;
+          });
+        }
+        if (delta.messages) {
+          setMessages((prev) => {
+            const next = { ...next };
+            for (const [chatId, msgs] of Object.entries(delta.messages)) {
+              next[chatId] = [...(prev[chatId] || []), ...msgs].sort((a,b) => a.ts - b.ts);
+            }
+            return next;
+          });
+        }
+        if (delta.friends) setFriends(prev => ({ ...prev, ...delta.friends }));
+        if (delta.groups) setGroups(prev => ({ ...prev, ...delta.groups }));
+      });
+      setP2p(nexus.network);
+    })();
+
 
     // Heartbeat to Firestore to signal online status
     const heartbeat = setInterval(async () => {
@@ -591,7 +302,7 @@ export default function App() {
 
   // ── Broadcast state ──
   const broadcast = useCallback((delta) => {
-    if (p2p) p2p.push(delta);
+    if (p2p) p2p.gossip(delta);
   }, [p2p]);
 
   // ── Register / Login ──
@@ -602,6 +313,7 @@ export default function App() {
       try {
         // 🛡️ ULTRA-SECURE: Generate non-exportable hardware-bound key pair
         const idData = await identity.create(phoneToUse);
+        const ecdhPublicKey = await security.init();
 
         const user = {
           id: idData.did,
@@ -611,6 +323,7 @@ export default function App() {
           nodeId: nodeId,
           publicKey: idData.publicKey,
           proof: idData.proof, // Signed phone + challenge
+          ecdhPublicKey,
           attestation: idData.attestation,
           bio: data.bio || "",
           avatarColor: avatarColor(data.name),
@@ -627,7 +340,7 @@ export default function App() {
         };
 
         await db.put("users", user);
-        await db.put("state", { id: "app", userId: user.id });
+        await db.put("metadata", { id: "currentUser", ...user });
         
         try {
           await setDoc(doc(firestore, "users", user.id), user);
@@ -657,15 +370,18 @@ export default function App() {
     const detectedPhone = getDetectedPhoneNumber(nodeId);
     
     triggerSimDetection(async () => {
+        const ecdhPublicKey = await security.init();
       try {
         const idData = await identity.create(detectedPhone);
         
+        const ecdhPublicKey = await security.init();
         const updated = {
           ...currentUser,
           phone: detectedPhone,
           verified: true,
           publicKey: idData.publicKey,
           proof: idData.proof,
+          ecdhPublicKey,
           attestation: idData.attestation,
           ts: now(),
         };
@@ -691,7 +407,7 @@ export default function App() {
   }, [currentUser, nodeId, broadcast, showToast, triggerSimDetection]);
 
   const logout = useCallback(async () => {
-    await db.put("state", { id: "app", userId: null });
+    await db.delete("metadata", "currentUser");
     setCurrentUser(null);
     setView(VIEWS.REGISTER);
   }, []);
@@ -709,11 +425,19 @@ export default function App() {
   // ── Send Message ──
   const sendMessage = useCallback(async (chatId, content, type = "text") => {
     if (!currentUser) return;
+    let finalContent = content;
+    if (chatId.includes("_") && type === "text") {
+      const otherId = chatId.split("_").find(id => id !== currentUser.id);
+      const otherUser = users[otherId];
+      if (otherUser && otherUser.ecdhPublicKey) {
+        try { finalContent = await security.encrypt(content, otherUser.ecdhPublicKey); } catch (e) { console.error("Encryption failed", e); }
+      }
+    }
     const msg = {
       id: uid(),
       chatId,
       from: currentUser.id,
-      content,
+      content: finalContent,
       type,
       ts: now(),
       status: "sent",
@@ -843,7 +567,44 @@ export default function App() {
   }, [updateProfile]);
 
   // ─── Props bundle ─────────────────────────────────────────
-  const ctx = {
+    // ── Sync users from Firestore ──
+  useEffect(() => {
+    if (!currentUser) return;
+    const usersRef = collection(firestore, "users");
+    const q = query(usersRef, limit(100)); // Increased limit
+
+    // Use onSnapshot for real-time updates and discovery
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const fetchedUsers = {};
+      let needsOwnUpdate = false;
+
+      snapshot.forEach((doc) => {
+        const u = doc.data();
+        fetchedUsers[u.id] = u;
+        db.put("users", u); // Keep local DB in sync
+
+        // If our own profile in Firestore is missing normalizedPhone or nodeId, flag it for auto-update
+        if (u.id === currentUser.id && (!u.normalizedPhone || !u.nodeId)) {
+          needsOwnUpdate = true;
+        }
+      });
+
+      setUsers((prev) => {
+        return { ...prev, ...fetchedUsers };
+      });
+
+      if (needsOwnUpdate) {
+        console.log("[Migration] Auto-updating own profile in Firestore with normalizedPhone and nodeId...");
+        updateProfile({});
+      }
+    }, (error) => {
+      console.error("Firestore snapshot error:", error);
+    });
+
+    return () => unsubscribe();
+  }, [currentUser, nodeId, updateProfile]);
+
+const ctx = {
     view, setView, currentUser, users, setUsers, messages, groups, friends,
     selectedChat, setSelectedChat, isOnline, toast,
     registerUser, logout, sendMessage,
@@ -1266,7 +1027,7 @@ function LoginScreen({ ctx }) {
           console.warn("Could not restore identity during login:", err);
         }
         ctx.setCurrentUser?.(user);
-        await db.put("state", { id: "app", userId: user.id });
+        await db.put("metadata", { id: "currentUser", ...user });
         ctx.showToast(`Réseau cellulaire vérifié. Connexion établie ✓`, "success");
         ctx.setView(VIEWS.HOME);
       } else {
@@ -1467,7 +1228,7 @@ function ChatScreen({ ctx, isGroup }) {
           item.type === "date" ? (
             <div key={i} style={{ textAlign: "center", fontSize: 10, color: "#555", margin: "8px 0" }}>{item.label}</div>
           ) : (
-            <MessageBubble key={item.msg.id} msg={item.msg} isMe={item.msg.from === ctx.currentUser?.id} sender={ctx.users[item.msg.from]} isGroup={isGroup} />
+            <MessageBubble key={item.msg.id} msg={item.msg} isMe={item.msg.from === ctx.currentUser?.id} sender={ctx.users[item.msg.from]} isGroup={isGroup} ctx={ctx} />
           )
         )}
         {msgs.length === 0 && (
@@ -1503,8 +1264,29 @@ function ChatScreen({ ctx, isGroup }) {
   );
 }
 
-function MessageBubble({ msg, isMe, sender, isGroup }) {
-  const bg = isMe ? "linear-gradient(135deg, var(--primary), var(--secondary))" : "#1b1b2f";
+function MessageBubble({ msg, isMe, sender, isGroup, ctx }) {
+
+  const [decrypted, setDecrypted] = React.useState(msg.content);
+  React.useEffect(() => {
+    (async () => {
+      if (msg.chatId.includes("_") && msg.type === "text" && msg.content.startsWith('{"iv":')) {
+        try {
+          const otherId = msg.chatId.split("_").find(id => id !== msg.from);
+          // We need the sender's public key to decrypt if they sent it,
+          // or the recipient's public key if WE sent it? No, we always use the OTHER person's public key with our private key.
+          // Wait, Security.decrypt(json, senderPub). Yes.
+          const sender = ctx.users[msg.from];
+          if (sender && sender.ecdhPublicKey) {
+            const clear = await security.decrypt(msg.content, sender.ecdhPublicKey);
+            setDecrypted(clear);
+          }
+        } catch (e) { console.error("Decryption error", e); }
+      } else {
+        setDecrypted(msg.content);
+      }
+    })();
+  }, [msg.content, msg.from, msg.chatId, ctx.users]);
+const bg = isMe ? "linear-gradient(135deg, var(--primary), var(--secondary))" : "#1b1b2f";
   return (
     <div style={{ display: "flex", flexDirection: isMe ? "row-reverse" : "row", gap: 8, alignItems: "flex-end", maxWidth: "80%", alignSelf: isMe ? "flex-end" : "flex-start" }}>
       {!isMe && isGroup && <Avatar name={sender?.name || "?"} size={28} color={avatarColor(sender?.name)} />}
@@ -1512,9 +1294,9 @@ function MessageBubble({ msg, isMe, sender, isGroup }) {
         {!isMe && isGroup && <div style={{ fontSize: 11, color: "var(--secondary)", marginBottom: 2 }}>{sender?.name}</div>}
         <div style={{ background: bg, border: isMe ? 'none' : 'var(--glass-border)', borderRadius: isMe ? "16px 16px 4px 16px" : "16px 16px 16px 4px", padding: "10px 14px" }}>
           {msg.type === "audio" ? (
-            <audio controls src={msg.content} style={{ height: 32, maxWidth: 220 }} />
+            <audio controls src={decrypted} style={{ height: 32, maxWidth: 220 }} />
           ) : (
-            <div style={{ fontSize: 13.5, color: "#fff", lineHeight: 1.45 }}>{msg.content}</div>
+            <div style={{ fontSize: 13.5, color: "#fff", lineHeight: 1.45 }}>{decrypted}</div>
           )}
         </div>
         <div style={{ fontSize: 9, color: "var(--text-dim)", textAlign: isMe ? "right" : "left", marginTop: 4 }}>
@@ -2160,8 +1942,8 @@ function DiscoverScreen({ ctx }) {
       if (u.id === myId) return false;
       if (myFriends.includes(u.id)) return false;
       if (passedIds.includes(u.id)) return false;
-      if (filterName && !u.name.toLowerCase().includes(filterName.toLowerCase())) return false;
-      if (filterCity && u.city && !u.city.toLowerCase().includes(filterCity.toLowerCase())) return false;
+      if (filterName && !u.name?.toLowerCase().includes(filterName.toLowerCase())) return false;
+      if (filterCity && u.city && !u.city?.toLowerCase().includes(filterCity.toLowerCase())) return false;
       if (u.age && (u.age < filterMinAge || u.age > filterMaxAge)) return false;
       const isOnline = u.online && (u.ts > Date.now() - 45000);
       return isOnline;
