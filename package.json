@@ -11,8 +11,8 @@
     "android:open": "cap open android"
   },
   "dependencies": {
-    "@capgo/capacitor-sim": "^8.0.31",
     "@dataconnect/generated": "file:src/dataconnect-generated",
+    "@jonz94/capacitor-sim": "^2.0.0",
     "firebase": "^12.15.0",
     "framer-motion": "^10.12.16",
     "lucide-react": "^0.221.0",
