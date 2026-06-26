@@ -115,6 +115,6 @@ jobs:
       - name: Deploy to Firebase
         uses: w9jds/firebase-action@master
         with:
-          args: deploy --only firestore,database,remoteconfig,storage
+          args: deploy --only firestore,remoteconfig --non-interactive
         env:
           GCP_SA_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_NEXUS_CHAT_A205E }}
