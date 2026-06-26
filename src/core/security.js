@@ -143,8 +143,12 @@ export class Security {
         e.target.result.createObjectStore('keys', { keyPath: 'id' });
       };
       req.onsuccess = (e) => {
-        const tx = e.target.result.transaction('keys', mode);
-        res(tx.objectStore('keys'));
+        try {
+          const tx = e.target.result.transaction('keys', mode);
+          res(tx.objectStore('keys'));
+        } catch (err) {
+          rej(err);
+        }
       };
       req.onerror = rej;
     });

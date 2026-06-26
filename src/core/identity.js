@@ -161,8 +161,12 @@ export class Identity {
         }
       };
       req.onsuccess = (e) => {
-        const tx = e.target.result.transaction('keypair', mode);
-        res(tx.objectStore('keypair'));
+        try {
+          const tx = e.target.result.transaction('keypair', mode);
+          res(tx.objectStore('keypair'));
+        } catch (err) {
+          rej(err);
+        }
       };
       req.onerror = rej;
     });

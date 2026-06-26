@@ -113,6 +113,13 @@ const maskPhoneNumber = (phone) => {
 
 const normalizePhoneNumber = (phone = "") => phone.toString().replace(/[\s\-().]/g, '');
 
+const withTimeout = (promise, ms, errorMsg = "Délai d'attente dépassé") => {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(errorMsg)), ms))
+  ]);
+};
+
 const hasGrantedSimPermissions = (status) => {
   const values = [
     status?.readSimCard,
@@ -311,9 +318,10 @@ export default function App() {
         const user = storedState;
         if (user) { setCurrentUser(user); setView(VIEWS.HOME); }
         else {
-          const sims = await getRealSimNumbers();
-          setDetectedSims(sims);
-          const validSims = sims.filter(Boolean);
+          const sims = await getRealSimCards();
+          const simNumbers = getSimPhoneNumbers(sims);
+          setDetectedSims(simNumbers);
+          const validSims = simNumbers.filter(Boolean);
           if (validSims.length > 1) {
             setView(VIEWS.SIM_SELECT);
           } else if (validSims.length === 1) {
@@ -324,9 +332,10 @@ export default function App() {
         }
       } else {
         setTimeout(async () => {
-          const sims = await getRealSimNumbers();
-          setDetectedSims(sims);
-          const validSims = sims.filter(Boolean);
+          const sims = await getRealSimCards();
+          const simNumbers = getSimPhoneNumbers(sims);
+          setDetectedSims(simNumbers);
+          const validSims = simNumbers.filter(Boolean);
           if (validSims.length > 1) {
             setView(VIEWS.SIM_SELECT);
           } else if (validSims.length === 1) {
@@ -426,11 +435,10 @@ export default function App() {
         await db.put("users", user);
         await db.put("metadata", { id: "currentUser", ...user });
 
-        try {
-          await setDoc(doc(firestore, "users", user.id), user);
-        } catch (e) {
+        // Save in Firestore asynchronously in the background to prevent blocking/hanging
+        setDoc(doc(firestore, "users", user.id), user).catch((e) => {
           console.error("Failed to save user to Firestore on auto-register:", e);
-        }
+        });
 
         setUsers((prev) => ({ ...prev, [user.id]: user }));
         setFriends((prev) => ({ ...prev, [user.id]: [] }));
@@ -461,6 +469,8 @@ export default function App() {
       return;
     }
 
+    const isDetected = isDetectedSimNumber(phoneToUse, detectedSims);
+
     const doRegister = async () => {
       try {
         const idData = await identity.create(phoneToUse);
@@ -482,7 +492,7 @@ export default function App() {
           gender: data.gender || "",
           city: data.city || "",
           interests: data.interests || [],
-          verified: Capacitor.isNativePlatform(),
+          verified: isDetected,
           premium: false,
           superAdmin: Object.keys(users).length === 0,
           photos: data.photos || [],
@@ -493,11 +503,10 @@ export default function App() {
         await db.put("users", user);
         await db.put("metadata", { id: "currentUser", ...user });
 
-        try {
-          await setDoc(doc(firestore, "users", user.id), user);
-        } catch (e) {
+        // Save in Firestore asynchronously in the background to prevent blocking/hanging
+        setDoc(doc(firestore, "users", user.id), user).catch((e) => {
           console.error("Failed to save user to Firestore on register:", e);
-        }
+        });
 
         setUsers((prev) => {
           const next = { ...prev, [user.id]: user };
@@ -508,14 +517,15 @@ export default function App() {
         await db.put("friends", { id: user.id, list: [] });
         setCurrentUser(user);
         setView(VIEWS.HOME);
-        showToast(Capacitor.isNativePlatform() ? "Compte sécurisé et authentifié via SIM! 🎉" : "Compte créé avec succès! 🎉", "success");
+        showToast(isDetected ? "Compte sécurisé et authentifié via SIM! 🎉" : "Compte créé avec succès! 🎉", "success");
       } catch (err) {
         console.error("Registration error:", err);
         showToast("Échec de l'inscription : " + err.message, "error");
       }
     };
 
-    if (Capacitor.isNativePlatform()) {
+    // Only run simulated SIM detection if on native device AND using a detected SIM number
+    if (Capacitor.isNativePlatform() && isDetected) {
       triggerSimDetection(doRegister);
     } else {
       await doRegister();
@@ -524,8 +534,9 @@ export default function App() {
 
   const verifySimNumber = useCallback(async () => {
     if (!currentUser) return;
-    const sims = await getRealSimNumbers();
-    const detectedPhone = sims[0];
+    const sims = await getRealSimCards();
+    const simNumbers = getSimPhoneNumbers(sims);
+    const detectedPhone = simNumbers[0];
 
     if (!detectedPhone) {
       showToast("Aucune carte SIM détectée pour la vérification.", "error");
@@ -548,11 +559,11 @@ export default function App() {
         };
 
         await db.put("users", updated);
-        try {
-          await setDoc(doc(firestore, "users", updated.id), updated);
-        } catch (e) {
+        
+        // Save in Firestore asynchronously in the background to prevent blocking/hanging
+        setDoc(doc(firestore, "users", updated.id), updated).catch((e) => {
           console.error("Failed to save user verification to Firestore:", e);
-        }
+        });
 
         setCurrentUser(updated);
         setUsers((prev) => {
@@ -697,11 +708,10 @@ export default function App() {
     };
     await db.put("users", updated);
     
-    try {
-      await setDoc(doc(firestore, "users", updated.id), updated);
-    } catch (e) {
+    // Save in Firestore asynchronously in the background to prevent blocking/hanging
+    setDoc(doc(firestore, "users", updated.id), updated).catch((e) => {
       console.error("Failed to update user in Firestore:", e);
-    }
+    });
 
     setCurrentUser(updated);
     setUsers((prev) => {
@@ -1168,7 +1178,7 @@ function RegisterScreen({ ctx }) {
       <Field label="Ville" value={form.city} onChange={set("city")} placeholder="Paris" />
       <Field label="Centres d'intérêt (séparés par virgules)" value={form.interests} onChange={set("interests")} placeholder="musique, sport, tech" />
       <div className="register-submit-btn">
-        <Btn label={registering ? "Inscription en cours..." : (Capacitor.isNativePlatform() ? "S'inscrire via carte SIM" : "S'inscrire")} onClick={submit} full style={{ marginTop: '10px' }} disabled={registering} />
+        <Btn label={registering ? "Inscription en cours..." : (Capacitor.isNativePlatform() && ctx.detectedSims.includes(form.phone.trim()) ? "S'inscrire via carte SIM" : "S'inscrire")} onClick={submit} full style={{ marginTop: '10px' }} disabled={registering} />
       </div>
       <p style={{ textAlign: "center", color: "#888", fontSize: 13, marginTop: 16 }}>
         Déjà un compte?{" "}
@@ -1196,6 +1206,8 @@ function LoginScreen({ ctx }) {
       return;
     }
 
+    const isDetected = ctx.detectedSims.some(Boolean) && ctx.detectedSims.includes(phoneToUse);
+
     const doLogin = async () => {
       const cleanPhoneToUse = phoneToUse.replace(/[\s\-()]/g, '');
 
@@ -1211,7 +1223,11 @@ function LoginScreen({ ctx }) {
           const q = query(usersRef, where("phone", "==", phoneToUse), limit(1));
           const q2 = query(usersRef, where("normalizedPhone", "==", cleanPhoneToUse), limit(1));
 
-          const [snap1, snap2] = await Promise.all([getDocs(q), getDocs(q2)]);
+          const [snap1, snap2] = await withTimeout(
+            Promise.all([getDocs(q), getDocs(q2)]),
+            4000,
+            "Impossible de joindre le serveur. Veuillez vérifier votre connexion."
+          );
           const matchedDoc = !snap1.empty ? snap1.docs[0] : (!snap2.empty ? snap2.docs[0] : null);
 
           if (matchedDoc) {
@@ -1220,6 +1236,7 @@ function LoginScreen({ ctx }) {
           }
         } catch (e) {
           console.error("Firestore login search error:", e);
+          ctx.showToast(e.message || "Erreur de connexion au serveur", "error");
         }
       }
 
@@ -1231,7 +1248,7 @@ function LoginScreen({ ctx }) {
         }
         ctx.setCurrentUser(user);
         await db.put("metadata", { id: "currentUser", ...user });
-        ctx.showToast(Capacitor.isNativePlatform() ? `Réseau cellulaire vérifié. Connexion établie ✓` : `Connexion établie ✓`, "success");
+        ctx.showToast(isDetected ? `Réseau cellulaire vérifié. Connexion établie ✓` : `Connexion établie ✓`, "success");
         ctx.setView(VIEWS.HOME);
       } else {
         ctx.showToast("Aucun compte associé à ce numéro de téléphone. Veuillez créer un compte.", "error");
@@ -1239,12 +1256,14 @@ function LoginScreen({ ctx }) {
       }
     };
 
-    if (Capacitor.isNativePlatform()) {
+    if (Capacitor.isNativePlatform() && isDetected) {
       ctx.triggerSimDetection(doLogin);
     } else {
       await doLogin();
     }
   };
+
+  const isDetected = ctx.detectedSims.some(Boolean) && phone.trim() && ctx.detectedSims.includes(phone.trim());
 
   return (
     <Screen title="Connexion Réseau" subtitle="Connexion sécurisée par carte SIM">
@@ -1263,7 +1282,7 @@ function LoginScreen({ ctx }) {
         </p>
       </div>
 
-      <Btn label="Se connecter" onClick={login} full style={{ marginTop: '10px' }} />
+      <Btn label={isDetected ? "Se connecter via carte SIM" : "Se connecter"} onClick={login} full style={{ marginTop: '10px' }} />
       <p style={{ textAlign: "center", color: "#888", fontSize: 13, marginTop: 16 }}>
         Nouveau sur Nexus?{" "}
         <span style={{ color: "#6C63FF", cursor: "pointer", fontWeight: 'bold' }} onClick={() => ctx.setView(VIEWS.REGISTER)}>Créer un compte</span>
