@@ -103,3 +103,18 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+  # ─── Job 4 : Deploy Firebase (Rules, Config, etc.) ──────────────────────
+  deploy-firebase:
+    runs-on: ubuntu-latest
+    needs: build-web
+    # Uniquement sur push vers main/master
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to Firebase
+        uses: w9jds/firebase-action@master
+        with:
+          args: deploy --only firestore,database,remoteconfig,storage
+        env:
+          GCP_SA_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_NEXUS_CHAT_A205E }}
