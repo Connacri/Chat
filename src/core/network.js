@@ -3,6 +3,9 @@
  * Implements self-optimizing adaptive gossip protocol and offline write buffering.
  */
 import { DHT } from './dht.js';
+import { WebRTCP2P } from './webrtc.js';
+import { firestore } from './firebase.js';
+import { collection, setDoc, doc, onSnapshot } from 'firebase/firestore';
 
 export class P2PNetwork {
   constructor(nodeId, onSync) {
@@ -11,7 +14,7 @@ export class P2PNetwork {
     this.channel = new BroadcastChannel("nexus_p2p_channel"); // Browser local sync
     this.dht = new DHT(nodeId);
     
-    // peers: nodeId -> { lastSeen, latency, score }
+    // peers: nodeId -> { lastSeen, latency, score, type: 'rtc' | 'local' }
     this.peers = new Map(); 
     this.isOnline = true;
     this.seenMessages = new Set();
@@ -23,11 +26,14 @@ export class P2PNetwork {
     this.gossipInterval = 1000; // default in ms
     this.pingTimestamps = new Map(); // msgId -> sendTime
 
+    // WebRTC signaling and data channels
+    this.rtc = new WebRTCP2P(nodeId, (data, from) => this.handleMessage({ ...data, from, via: 'rtc' }));
+
     this.init();
   }
 
   async init() {
-    this.channel.onmessage = (e) => this.handleMessage(e.data);
+    this.channel.onmessage = (e) => this.handleMessage({ ...e.data, via: 'local' });
 
     // Clear seen messages every 5 minutes to cap memory growth
     setInterval(() => this.seenMessages.clear(), 5 * 60 * 1000);
@@ -37,10 +43,42 @@ export class P2PNetwork {
       if (this.isOnline) {
         this.pingPeers();
         this.optimizeParameters();
+        this.announcePresence();
       }
     }, 4000);
 
     this.broadcast('HELLO', { nodeId: this.nodeId });
+    this.discoverPeers();
+  }
+
+  async announcePresence() {
+    if (!this.isOnline) return;
+    try {
+      await setDoc(doc(firestore, 'nodes', this.nodeId), {
+        id: this.nodeId,
+        lastSeen: Date.now()
+      });
+    } catch (e) {
+      console.warn("Presence announcement failed", e);
+    }
+  }
+
+  discoverPeers() {
+    // Listen for other nodes in Firestore
+    onSnapshot(collection(firestore, 'nodes'), (snapshot) => {
+      snapshot.docChanges().forEach((change) => {
+        if (change.type === 'added' || change.type === 'modified') {
+          const node = change.doc.data();
+          if (node.id !== this.nodeId && Date.now() - node.lastSeen < 60000) {
+            // Potential peer found, try connecting if not already connected via WebRTC
+            if (!this.rtc.peers.has(node.id)) {
+              console.log(`[P2PNetwork] Discovered peer ${node.id}, connecting via WebRTC...`);
+              this.rtc.connectToPeer(node.id);
+            }
+          }
+        }
+      });
+    });
   }
 
   pingPeers() {
@@ -73,14 +111,14 @@ export class P2PNetwork {
 
   handleMessage(data) {
     if (!this.isOnline) return;
-    const { from, type, payload, msgId, to } = data;
+    const { from, type, payload, msgId, to, via } = data;
 
     if (from === this.nodeId) return;
     if (to && to !== this.nodeId) return; // Targeted message
     if (msgId && this.seenMessages.has(msgId)) return;
     if (msgId) this.seenMessages.add(msgId);
 
-    this.updatePeer(from);
+    this.updatePeer(from, via);
 
     switch (type) {
       case 'PING':
@@ -109,26 +147,38 @@ export class P2PNetwork {
       case 'HELLO_ACK':
         this.dht.addNode(from, {});
         break;
-      case 'SIGNAL':
-        this.handleWebRTCSignal(payload, from);
-        break;
     }
   }
 
-  updatePeer(id) {
-    const peer = this.peers.get(id) || { latency: 50, score: 10 };
+  updatePeer(id, via) {
+    const peer = this.peers.get(id) || { latency: 50, score: 10, via };
     peer.lastSeen = Date.now();
+    peer.via = via; // Prefer local if both are available?
     this.peers.set(id, peer);
   }
 
   broadcast(type, payload, existingMsgId = null) {
     const msgId = existingMsgId || crypto.randomUUID();
-    this.channel.postMessage({ from: this.nodeId, type, payload, msgId });
+    const data = { from: this.nodeId, type, payload, msgId };
+
+    // Broadcast locally
+    this.channel.postMessage(data);
+
+    // Broadcast via WebRTC
+    this.rtc.broadcast(data);
   }
 
   send(type, payload, to) {
     const msgId = crypto.randomUUID();
-    this.channel.postMessage({ from: this.nodeId, type, payload, to, msgId });
+    const data = { from: this.nodeId, type, payload, to, msgId };
+
+    // Try sending via WebRTC if available
+    if (this.rtc.dataChannels.has(to)) {
+      this.rtc.sendToPeer(to, data);
+    } else {
+      // Fallback to local broadcast channel (it handles 'to' filtering)
+      this.channel.postMessage(data);
+    }
   }
 
   gossip(delta) {
@@ -156,12 +206,6 @@ export class P2PNetwork {
       // If no high-quality peers are known, fallback to global broadcast
       this.broadcast('GOSSIP', delta, existingMsgId);
     }
-  }
-
-  handleWebRTCSignal(signal, from) {
-    console.log(`WebRTC Signal from ${from}`, signal);
-    const event = new CustomEvent('nexus-rtc-signal', { detail: { signal, from } });
-    window.dispatchEvent(event);
   }
 
   toggleOnline() {

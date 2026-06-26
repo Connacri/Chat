@@ -2,7 +2,7 @@
  * WebRTC P2P Signaling Layer via Firestore
  * Allows inter-device P2P communication when BroadcastChannel is not enough.
  */
-import { firestore } from './firebase';
+import { firestore } from './firebase.js';
 import { collection, addDoc, onSnapshot, query, where, deleteDoc, doc, getDocs } from 'firebase/firestore';
 
 export class WebRTCP2P {

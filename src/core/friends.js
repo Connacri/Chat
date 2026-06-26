@@ -13,6 +13,9 @@ export class FriendManager {
       if (nexus.network) {
         nexus.network.gossip({ friends: { [myId]: list } });
       }
+
+      // Also, if we know this friend, we might want to ensure they are in our users DB
+      // and maybe send them a 'HELLO' to establish WebRTC connection if needed.
       return true;
     }
     return false;

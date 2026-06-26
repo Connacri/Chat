@@ -1,9 +1,32 @@
 // Setup browser/Web globals for testing in Node.js before other imports execute
 
+const noop = () => {};
+
+// Mock Navigator
+try {
+  Object.defineProperty(globalThis, 'navigator', {
+    value: {
+      userAgent: 'node',
+      serviceWorker: { register: () => Promise.resolve() },
+      geolocation: {
+        getCurrentPosition: (cb) => cb({ coords: { latitude: 48.8566, longitude: 2.3522 } })
+      }
+    },
+    configurable: true
+  });
+} catch(e) {}
+
+globalThis.Notification = { requestPermission: async () => 'denied' };
+
 globalThis.window = {
-  dispatchEvent: () => {},
-  addEventListener: () => {},
-  removeEventListener: () => {},
+  dispatchEvent: noop,
+  addEventListener: noop,
+  removeEventListener: noop,
+  location: { reload: noop },
+  localStorage: {
+    getItem: () => null,
+    setItem: noop
+  }
 };
 
 globalThis.CustomEvent = class CustomEvent {
@@ -12,6 +35,73 @@ globalThis.CustomEvent = class CustomEvent {
     this.detail = options?.detail;
   }
 };
+
+globalThis.BroadcastChannel = class BroadcastChannel {
+    constructor() {
+        this.onmessage = null;
+    }
+    postMessage() {}
+    close() {}
+};
+
+// Mock Crypto
+const mockCrypto = {
+    subtle: {
+        generateKey: async () => ({ publicKey: {}, privateKey: {} }),
+        exportKey: async () => new Uint8Array(32).buffer,
+        importKey: async () => ({}),
+        sign: async () => new Uint8Array(64).buffer,
+        verify: async () => true,
+        digest: async () => new Uint8Array(32).buffer,
+        deriveKey: async () => ({}),
+        deriveBits: async () => new Uint8Array(32).buffer,
+        encrypt: async () => new Uint8Array(32).buffer,
+        decrypt: async () => new Uint8Array(32).buffer
+    },
+    getRandomValues: (arr) => {
+        for(let i=0; i<arr.length; i++) arr[i] = Math.floor(Math.random() * 256);
+        return arr;
+    },
+    randomUUID: () => 'test-uuid-' + Math.random()
+};
+
+try {
+    Object.defineProperty(globalThis, 'crypto', {
+        value: mockCrypto,
+        configurable: true
+    });
+} catch(e) {
+    globalThis.crypto = mockCrypto;
+}
+
+// Mock TextEncoder/Decoder
+if (typeof TextEncoder === 'undefined') {
+    globalThis.TextEncoder = class TextEncoder {
+        encode(s) { return Buffer.from(s); }
+    };
+}
+if (typeof TextDecoder === 'undefined') {
+    globalThis.TextDecoder = class TextDecoder {
+        decode(b) { return Buffer.from(b).toString(); }
+    };
+}
+
+// Mock btoa/atob
+globalThis.btoa = (s) => Buffer.from(s, 'binary').toString('base64');
+globalThis.atob = (s) => Buffer.from(s, 'base64').toString('binary');
+
+// Mock RTCPeerConnection
+globalThis.RTCPeerConnection = class {
+    constructor() {}
+    createDataChannel() { return { onmessage: noop, onopen: noop, onclose: noop, send: noop }; }
+    createOffer() { return Promise.resolve({}); }
+    setLocalDescription() { return Promise.resolve(); }
+    setRemoteDescription() { return Promise.resolve(); }
+    createAnswer() { return Promise.resolve({}); }
+    addIceCandidate() { return Promise.resolve(); }
+};
+globalThis.RTCSessionDescription = class { constructor(obj) { Object.assign(this, obj); } };
+globalThis.RTCIceCandidate = class { constructor(obj) { Object.assign(this, obj); } };
 
 // In-Memory IndexedDB Mock
 const mockDatabases = new Map();
