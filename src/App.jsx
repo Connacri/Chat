@@ -106,22 +106,55 @@ const VIEWS = {
 // Masquage du numéro de téléphone (cache tout sauf les 3 derniers chiffres)
 const maskPhoneNumber = (phone) => {
   if (!phone) return "*******";
-  const clean = phone.replace(/[\s\-()]/g, '');
+  const clean = normalizePhoneNumber(phone);
   if (clean.length <= 3) return clean;
   return "*".repeat(clean.length - 3) + clean.slice(-3);
 };
 
-// Récupération des vrais numéros de téléphone via Capacitor (Android uniquement)
-const getRealSimNumbers = async () => {
+const normalizePhoneNumber = (phone = "") => phone.toString().replace(/[\s\-().]/g, '');
+
+const hasGrantedSimPermissions = (status) => {
+  const values = [
+    status?.readSimCard,
+    status?.readPhoneState,
+    status?.readPhoneNumbers,
+  ].filter(Boolean);
+
+  return values.length > 0 && values.every((value) => value === 'granted');
+};
+
+const getSimPhoneNumbers = (simCards = []) => {
+  const seen = new Set();
+  return simCards
+    .map((sim) => (sim?.number || "").trim())
+    .filter(Boolean)
+    .filter((phone) => {
+      const normalized = normalizePhoneNumber(phone);
+      if (!normalized || seen.has(normalized)) return false;
+      seen.add(normalized);
+      return true;
+    });
+};
+
+const isDetectedSimNumber = (phone, detectedNumbers = []) => {
+  const normalized = normalizePhoneNumber(phone);
+  return !!normalized && detectedNumbers.some((detected) => normalizePhoneNumber(detected) === normalized);
+};
+
+// Récupération des cartes SIM via Capacitor (Android uniquement).
+// Beaucoup d'opérateurs ne stockent pas le numéro sur la SIM: dans ce cas,
+// la carte est détectée mais `number` reste vide et l'utilisateur saisit son
+// numéro manuellement.
+const getRealSimCards = async () => {
   if (!Capacitor.isNativePlatform()) return [];
   try {
-    const perm = await Sim.checkPermissions();
-    if (perm.readSimCard !== 'granted') {
+    const perm = await Sim.checkPermissions().catch(() => null);
+    if (perm && !hasGrantedSimPermissions(perm)) {
       const req = await Sim.requestPermissions();
-      if (req.readSimCard !== 'granted') return [];
+      if (!hasGrantedSimPermissions(req)) return [];
     }
-    const { simCards } = await Sim.getSimCards();
-    return simCards.map(s => s.number).filter(Boolean);
+    const { simCards = [] } = await Sim.getSimCards();
+    return simCards.filter(Boolean);
   } catch (e) {
     console.warn("Real SIM detection failed:", e);
     return [];
@@ -280,10 +313,11 @@ export default function App() {
         else {
           const sims = await getRealSimNumbers();
           setDetectedSims(sims);
-          if (sims.length > 1) {
+          const validSims = sims.filter(Boolean);
+          if (validSims.length > 1) {
             setView(VIEWS.SIM_SELECT);
-          } else if (sims.length === 1) {
-            autoRegister(sims[0]);
+          } else if (validSims.length === 1) {
+            autoRegister(validSims[0]);
           } else {
             setView(VIEWS.REGISTER);
           }
@@ -292,10 +326,11 @@ export default function App() {
         setTimeout(async () => {
           const sims = await getRealSimNumbers();
           setDetectedSims(sims);
-          if (sims.length > 1) {
+          const validSims = sims.filter(Boolean);
+          if (validSims.length > 1) {
             setView(VIEWS.SIM_SELECT);
-          } else if (sims.length === 1) {
-            autoRegister(sims[0]);
+          } else if (validSims.length === 1) {
+            autoRegister(validSims[0]);
           } else {
             setView(VIEWS.REGISTER);
           }
@@ -420,64 +455,72 @@ export default function App() {
   // ── Register / Login ──
   const registerUser = useCallback(async (data) => {
     let phoneToUse = data.phone?.trim();
-    if (!phoneToUse && detectedSims.length > 0) phoneToUse = detectedSims[0];
+    if (!phoneToUse && detectedSims.some(Boolean)) phoneToUse = detectedSims.find(Boolean);
     if (!phoneToUse) {
       showToast("Numéro de téléphone requis pour l'inscription", "error");
       return;
     }
 
-    try {
-      const idData = await identity.create(phoneToUse);
-      const ecdhPublicKey = await security.init();
-
-      const user = {
-        id: idData.did,
-        name: data.name,
-        phone: phoneToUse,
-        normalizedPhone: phoneToUse.replace(/[\s\-()]/g, ''),
-        nodeId: nodeId,
-        publicKey: idData.publicKey,
-        proof: idData.proof,
-        ecdhPublicKey,
-        attestation: idData.attestation,
-        bio: data.bio || "",
-        avatarColor: avatarColor(data.name),
-        age: data.age || "",
-        gender: data.gender || "",
-        city: data.city || "",
-        interests: data.interests || [],
-        verified: Capacitor.isNativePlatform(),
-        premium: false,
-        superAdmin: Object.keys(users).length === 0,
-        photos: data.photos || [],
-        ts: now(),
-        online: true,
-      };
-
-      await db.put("users", user);
-      await db.put("metadata", { id: "currentUser", ...user });
-
+    const doRegister = async () => {
       try {
-        await setDoc(doc(firestore, "users", user.id), user);
-      } catch (e) {
-        console.error("Failed to save user to Firestore on register:", e);
-      }
+        const idData = await identity.create(phoneToUse);
+        const ecdhPublicKey = await security.init();
 
-      setUsers((prev) => {
-        const next = { ...prev, [user.id]: user };
-        broadcast({ users: { [user.id]: user } });
-        return next;
-      });
-      setFriends((prev) => ({ ...prev, [user.id]: [] }));
-      await db.put("friends", { id: user.id, list: [] });
-      setCurrentUser(user);
-      setView(VIEWS.HOME);
-      showToast(Capacitor.isNativePlatform() ? "Compte sécurisé et authentifié via SIM! 🎉" : "Compte créé avec succès! 🎉", "success");
-    } catch (err) {
-      console.error("Registration error:", err);
-      showToast("Échec de l'inscription : " + err.message, "error");
+        const user = {
+          id: idData.did,
+          name: data.name,
+          phone: phoneToUse,
+          normalizedPhone: phoneToUse.replace(/[\s\-()]/g, ''),
+          nodeId: nodeId,
+          publicKey: idData.publicKey,
+          proof: idData.proof,
+          ecdhPublicKey,
+          attestation: idData.attestation,
+          bio: data.bio || "",
+          avatarColor: avatarColor(data.name),
+          age: data.age || "",
+          gender: data.gender || "",
+          city: data.city || "",
+          interests: data.interests || [],
+          verified: Capacitor.isNativePlatform(),
+          premium: false,
+          superAdmin: Object.keys(users).length === 0,
+          photos: data.photos || [],
+          ts: now(),
+          online: true,
+        };
+
+        await db.put("users", user);
+        await db.put("metadata", { id: "currentUser", ...user });
+
+        try {
+          await setDoc(doc(firestore, "users", user.id), user);
+        } catch (e) {
+          console.error("Failed to save user to Firestore on register:", e);
+        }
+
+        setUsers((prev) => {
+          const next = { ...prev, [user.id]: user };
+          broadcast({ users: { [user.id]: user } });
+          return next;
+        });
+        setFriends((prev) => ({ ...prev, [user.id]: [] }));
+        await db.put("friends", { id: user.id, list: [] });
+        setCurrentUser(user);
+        setView(VIEWS.HOME);
+        showToast(Capacitor.isNativePlatform() ? "Compte sécurisé et authentifié via SIM! 🎉" : "Compte créé avec succès! 🎉", "success");
+      } catch (err) {
+        console.error("Registration error:", err);
+        showToast("Échec de l'inscription : " + err.message, "error");
+      }
+    };
+
+    if (Capacitor.isNativePlatform()) {
+      triggerSimDetection(doRegister);
+    } else {
+      await doRegister();
     }
-  }, [users, broadcast, showToast, nodeId, detectedSims]);
+  }, [users, broadcast, showToast, nodeId, detectedSims, triggerSimDetection]);
 
   const verifySimNumber = useCallback(async () => {
     if (!currentUser) return;
@@ -1069,8 +1112,9 @@ function RegisterScreen({ ctx }) {
 
   // Keep phone field updated if sims load asynchronously
   useEffect(() => {
-    if (ctx.detectedSims.length > 0 && !form.phone) {
-      setForm((p) => ({ ...p, phone: ctx.detectedSims[0] }));
+    const validNumber = ctx.detectedSims.find(Boolean);
+    if (validNumber && !form.phone) {
+      setForm((p) => ({ ...p, phone: validNumber }));
     }
   }, [ctx.detectedSims]);
 
@@ -1079,12 +1123,17 @@ function RegisterScreen({ ctx }) {
     if (!form.phone.trim()) { ctx.showToast("Numéro de téléphone requis", "error"); return; }
     ctx.registerUser({ ...form, interests: form.interests.split(",").map((i) => i.trim()).filter(Boolean) });
   };
+  const registering = ctx.simVerifying;
 
   return (
     <Screen title="Créer un compte" subtitle="Rejoignez Nexus via SIM sécurisée">
-      {ctx.detectedSims.length > 0 ? (
+      {ctx.detectedSims.some(Boolean) ? (
         <div style={{ background: "rgba(108, 99, 255, 0.05)", border: "var(--glass-border)", borderRadius: 12, padding: 14, marginBottom: 4, fontSize: 13, color: "var(--secondary)" }}>
-          🔒 Carte SIM détectée : <b>{ctx.detectedSims[0]}</b>.
+          🔒 Carte SIM détectée : <b>{ctx.detectedSims.find(Boolean)}</b>.
+        </div>
+      ) : ctx.detectedSims.length > 0 ? (
+        <div style={{ background: "rgba(255, 193, 7, 0.08)", border: "1px solid rgba(255, 193, 7, 0.3)", borderRadius: 12, padding: 14, marginBottom: 4, fontSize: 13, color: "#ffc107" }}>
+          📶 Carte SIM détectée, mais le numéro n'a pas pu être lu automatiquement. Veuillez entrer votre numéro manuellement.
         </div>
       ) : (
         <div style={{ background: "rgba(255, 107, 107, 0.05)", border: "1px solid rgba(255, 107, 107, 0.2)", borderRadius: 12, padding: 14, marginBottom: 4, fontSize: 13, color: "#ff6b6b" }}>
@@ -1119,7 +1168,7 @@ function RegisterScreen({ ctx }) {
       <Field label="Ville" value={form.city} onChange={set("city")} placeholder="Paris" />
       <Field label="Centres d'intérêt (séparés par virgules)" value={form.interests} onChange={set("interests")} placeholder="musique, sport, tech" />
       <div className="register-submit-btn">
-        <Btn label="S'inscrire via carte SIM" onClick={submit} full style={{ marginTop: '10px' }} />
+        <Btn label={registering ? "Inscription en cours..." : (Capacitor.isNativePlatform() ? "S'inscrire via carte SIM" : "S'inscrire")} onClick={submit} full style={{ marginTop: '10px' }} disabled={registering} />
       </div>
       <p style={{ textAlign: "center", color: "#888", fontSize: 13, marginTop: 16 }}>
         Déjà un compte?{" "}
@@ -1131,11 +1180,12 @@ function RegisterScreen({ ctx }) {
 
 // ─── Login ───────────────────────────────────────────────────
 function LoginScreen({ ctx }) {
-  const [phone, setPhone] = useState(ctx.detectedSims[0] || "");
+  const [phone, setPhone] = useState(ctx.detectedSims.find(Boolean) || "");
 
   useEffect(() => {
-    if (ctx.detectedSims.length > 0 && !phone) {
-      setPhone(ctx.detectedSims[0]);
+    const validNumber = ctx.detectedSims.find(Boolean);
+    if (validNumber && !phone) {
+      setPhone(validNumber);
     }
   }, [ctx.detectedSims]);
 
@@ -1200,15 +1250,20 @@ function LoginScreen({ ctx }) {
     <Screen title="Connexion Réseau" subtitle="Connexion sécurisée par carte SIM">
       <div style={{ background: "rgba(108, 99, 255, 0.08)", border: "var(--glass-border)", borderRadius: 16, padding: 20, marginBottom: 12, textAlign: "center", display: "flex", flexDirection: "column", alignItems: "stretch" }}>
         <div style={{ fontSize: 40, marginBottom: 8 }}>📱</div>
-        <div style={{ fontWeight: "700", color: "#fff", fontSize: "1rem", marginBottom: 6 }}>SIM Détectée</div>
+        <div style={{ fontWeight: "700", color: "#fff", fontSize: "1rem", marginBottom: 6 }}>
+          {ctx.detectedSims.length > 0 ? "SIM Détectée" : "Connexion sans SIM"}
+        </div>
         <Field label="Numéro de téléphone" value={phone} onChange={(e) => setPhone(e.target.value)} type="tel" placeholder="+224 600 00 00 00" />
         <p style={{ fontSize: 11.5, color: "var(--text-dim)", marginTop: 8, lineHeight: 1.4 }}>
-          Votre numéro de téléphone est détecté automatiquement, mais vous pouvez le modifier s'il est incorrect.
+          {ctx.detectedSims.some(Boolean)
+            ? "Votre numéro de téléphone est détecté automatiquement, mais vous pouvez le modifier s'il est incorrect."
+            : ctx.detectedSims.length > 0
+            ? "Carte SIM détectée mais le numéro n'a pas pu être lu automatiquement. Veuillez entrer votre numéro."
+            : "Entrez votre numéro de téléphone pour vous connecter."}
         </p>
       </div>
 
-      <Btn label="Se connecter via carte SIM" onClick={login} full style={{ marginTop: '10px' }} />
-      <Btn label="Entrer" onClick={login} full secondary style={{ marginTop: '10px' }} />
+      <Btn label="Se connecter" onClick={login} full style={{ marginTop: '10px' }} />
       <p style={{ textAlign: "center", color: "#888", fontSize: 13, marginTop: 16 }}>
         Nouveau sur Nexus?{" "}
         <span style={{ color: "#6C63FF", cursor: "pointer", fontWeight: 'bold' }} onClick={() => ctx.setView(VIEWS.REGISTER)}>Créer un compte</span>
@@ -2418,6 +2473,7 @@ function AdminScreen({ ctx }) {
 
 // ─── SIM Selection Screen ──────────────────────────────────────────
 function SIMSelectionScreen({ ctx }) {
+  const validSims = ctx.detectedSims.filter(Boolean);
   return (
     <Screen title="Choisir une SIM" subtitle="Plusieurs cartes SIM détectées">
       <div style={{ background: "rgba(108, 99, 255, 0.08)", border: "var(--glass-border)", borderRadius: 16, padding: 20, marginBottom: 12, textAlign: "center" }}>
@@ -2426,7 +2482,7 @@ function SIMSelectionScreen({ ctx }) {
           Veuillez sélectionner le numéro de téléphone que vous souhaitez utiliser pour votre identité Nexus.
         </p>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-          {ctx.detectedSims.map((phone, idx) => (
+          {validSims.map((phone, idx) => (
             <button
               key={idx}
               onClick={() => ctx.autoRegister(phone)}
@@ -2459,7 +2515,7 @@ function SIMSelectionScreen({ ctx }) {
 
 // ─── SIM Cryptographic Verification Overlay ───
 function SIMVerificationOverlay({ ctx }) {
-  const detectedPhone = ctx.detectedSims[0] || "SIM";
+  const detectedPhone = ctx.detectedSims.find(Boolean) || "Carte SIM";
   return (
     <div style={{
       position: 'fixed',
