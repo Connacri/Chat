@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "android:sync": "cap sync android",
+    "android:pin-kotlin-jvm": "node scripts/pin-android-kotlin-jvm-target.cjs",
     "android:open": "cap open android"
   },
   "dependencies": {

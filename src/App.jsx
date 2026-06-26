@@ -199,10 +199,14 @@ export default function App() {
 
   const triggerSimDetection = useCallback((onComplete) => {
     if (!Capacitor.isNativePlatform()) {
-      setSimVerifying(false);
-      Promise.resolve(onComplete()).catch(err => {
-        console.error("Error in triggerSimDetection callback:", err);
-      });
+      setSimStatus("success");
+      (async () => {
+        try {
+          await onComplete();
+        } catch (err) {
+          console.error("Error in triggerSimDetection callback:", err);
+        }
+      })();
       return;
     }
     setSimVerifying(true);
@@ -227,9 +231,13 @@ export default function App() {
         setSimStatus("success");
         setTimeout(() => {
           setSimVerifying(false);
-          Promise.resolve(onComplete()).catch(err => {
-            console.error("Error in triggerSimDetection callback:", err);
-          });
+          (async () => {
+            try {
+              await onComplete();
+            } catch (err) {
+              console.error("Error in triggerSimDetection callback:", err);
+            }
+          })();
         }, 800);
       }
     }, 400);
@@ -352,7 +360,7 @@ export default function App() {
 
   // ── Auto Register ──
   const autoRegister = useCallback(async (phone) => {
-    triggerSimDetection(async () => {
+    const doRegister = async () => {
       try {
         const idData = await identity.create(phone);
         const ecdhPublicKey = await security.init();
@@ -361,7 +369,7 @@ export default function App() {
 
         const user = {
           id: idData.did,
-          name: maskedPseudo, // Default pseudo is masked phone
+          name: maskedPseudo,
           phone: phone,
           normalizedPhone: phone.replace(/[\s\-()]/g, ''),
           nodeId: nodeId,
@@ -400,7 +408,13 @@ export default function App() {
         showToast("Échec de l'inscription automatique : " + err.message, "error");
         setView(VIEWS.REGISTER);
       }
-    });
+    };
+
+    if (Capacitor.isNativePlatform()) {
+      triggerSimDetection(doRegister);
+    } else {
+      await doRegister();
+    }
   }, [nodeId, triggerSimDetection, users, showToast]);
 
   // ── Register / Login ──
@@ -411,62 +425,59 @@ export default function App() {
       showToast("Numéro de téléphone requis pour l'inscription", "error");
       return;
     }
-    
-    triggerSimDetection(async () => {
+
+    try {
+      const idData = await identity.create(phoneToUse);
+      const ecdhPublicKey = await security.init();
+
+      const user = {
+        id: idData.did,
+        name: data.name,
+        phone: phoneToUse,
+        normalizedPhone: phoneToUse.replace(/[\s\-()]/g, ''),
+        nodeId: nodeId,
+        publicKey: idData.publicKey,
+        proof: idData.proof,
+        ecdhPublicKey,
+        attestation: idData.attestation,
+        bio: data.bio || "",
+        avatarColor: avatarColor(data.name),
+        age: data.age || "",
+        gender: data.gender || "",
+        city: data.city || "",
+        interests: data.interests || [],
+        verified: Capacitor.isNativePlatform(),
+        premium: false,
+        superAdmin: Object.keys(users).length === 0,
+        photos: data.photos || [],
+        ts: now(),
+        online: true,
+      };
+
+      await db.put("users", user);
+      await db.put("metadata", { id: "currentUser", ...user });
+
       try {
-        // 🛡️ ULTRA-SECURE: Generate non-exportable hardware-bound key pair
-        const idData = await identity.create(phoneToUse);
-        const ecdhPublicKey = await security.init();
-
-        const user = {
-          id: idData.did,
-          name: data.name,
-          phone: phoneToUse,
-          normalizedPhone: phoneToUse.replace(/[\s\-()]/g, ''),
-          nodeId: nodeId,
-          publicKey: idData.publicKey,
-          proof: idData.proof, // Signed phone + challenge
-          ecdhPublicKey,
-          attestation: idData.attestation,
-          bio: data.bio || "",
-          avatarColor: avatarColor(data.name),
-          age: data.age || "",
-          gender: data.gender || "",
-          city: data.city || "",
-          interests: data.interests || [],
-          verified: true, // Hardware binding counts as verification
-          premium: false,
-          superAdmin: Object.keys(users).length === 0,
-          photos: data.photos || [],
-          ts: now(),
-          online: true,
-        };
-
-        await db.put("users", user);
-        await db.put("metadata", { id: "currentUser", ...user });
-        
-        try {
-          await setDoc(doc(firestore, "users", user.id), user);
-        } catch (e) {
-          console.error("Failed to save user to Firestore on register:", e);
-        }
-
-        setUsers((prev) => {
-          const next = { ...prev, [user.id]: user };
-          broadcast({ users: { [user.id]: user } });
-          return next;
-        });
-        setFriends((prev) => ({ ...prev, [user.id]: [] }));
-        await db.put("friends", { id: user.id, list: [] });
-        setCurrentUser(user);
-        setView(VIEWS.HOME);
-        showToast("Compte sécurisé et authentifié via SIM! 🎉", "success");
-      } catch (err) {
-        console.error("SIM registration error:", err);
-        showToast("Échec de la validation SIM : " + err.message, "error");
+        await setDoc(doc(firestore, "users", user.id), user);
+      } catch (e) {
+        console.error("Failed to save user to Firestore on register:", e);
       }
-    });
-  }, [users, broadcast, showToast, nodeId, triggerSimDetection]);
+
+      setUsers((prev) => {
+        const next = { ...prev, [user.id]: user };
+        broadcast({ users: { [user.id]: user } });
+        return next;
+      });
+      setFriends((prev) => ({ ...prev, [user.id]: [] }));
+      await db.put("friends", { id: user.id, list: [] });
+      setCurrentUser(user);
+      setView(VIEWS.HOME);
+      showToast(Capacitor.isNativePlatform() ? "Compte sécurisé et authentifié via SIM! 🎉" : "Compte créé avec succès! 🎉", "success");
+    } catch (err) {
+      console.error("Registration error:", err);
+      showToast("Échec de l'inscription : " + err.message, "error");
+    }
+  }, [users, broadcast, showToast, nodeId, detectedSims]);
 
   const verifySimNumber = useCallback(async () => {
     if (!currentUser) return;
@@ -712,7 +723,7 @@ export default function App() {
   }, [currentUser, nodeId, updateProfile]);
 
 const ctx = {
-    view, setView, currentUser, users, setUsers, messages, groups, friends,
+    view, setView, currentUser, setCurrentUser, users, setUsers, messages, groups, friends,
     selectedChat, setSelectedChat, isOnline, toast,
     registerUser, logout, sendMessage,
     addFriend, createGroup, updateProfile, toggleOnline, getLocation,
@@ -1134,7 +1145,8 @@ function LoginScreen({ ctx }) {
       ctx.showToast("Veuillez entrer votre numéro de téléphone", "error");
       return;
     }
-    ctx.triggerSimDetection(async () => {
+
+    const doLogin = async () => {
       const cleanPhoneToUse = phoneToUse.replace(/[\s\-()]/g, '');
 
       let user = Object.values(ctx.users).find((u) => {
@@ -1143,16 +1155,15 @@ function LoginScreen({ ctx }) {
         return uPhoneNormalized === cleanPhoneToUse || uNormalizedField === cleanPhoneToUse;
       });
 
-      // If not found locally, search Firestore
       if (!user) {
         try {
           const usersRef = collection(firestore, "users");
           const q = query(usersRef, where("phone", "==", phoneToUse), limit(1));
           const q2 = query(usersRef, where("normalizedPhone", "==", cleanPhoneToUse), limit(1));
-          
+
           const [snap1, snap2] = await Promise.all([getDocs(q), getDocs(q2)]);
           const matchedDoc = !snap1.empty ? snap1.docs[0] : (!snap2.empty ? snap2.docs[0] : null);
-          
+
           if (matchedDoc) {
             user = matchedDoc.data();
             await db.put("users", user);
@@ -1163,21 +1174,26 @@ function LoginScreen({ ctx }) {
       }
 
       if (user) {
-        // Restore hardware key and set current user
         try {
           await identity.restore();
         } catch (err) {
           console.warn("Could not restore identity during login:", err);
         }
-        ctx.setCurrentUser?.(user);
+        ctx.setCurrentUser(user);
         await db.put("metadata", { id: "currentUser", ...user });
-        ctx.showToast(`Réseau cellulaire vérifié. Connexion établie ✓`, "success");
+        ctx.showToast(Capacitor.isNativePlatform() ? `Réseau cellulaire vérifié. Connexion établie ✓` : `Connexion établie ✓`, "success");
         ctx.setView(VIEWS.HOME);
       } else {
         ctx.showToast("Aucun compte associé à ce numéro de téléphone. Veuillez créer un compte.", "error");
         ctx.setView(VIEWS.REGISTER);
       }
-    });
+    };
+
+    if (Capacitor.isNativePlatform()) {
+      ctx.triggerSimDetection(doLogin);
+    } else {
+      await doLogin();
+    }
   };
 
   return (

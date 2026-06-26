@@ -63,6 +63,9 @@ jobs:
       - name: Sync Capacitor
         run: npx cap sync android || (npx cap add android && npx cap sync android)
 
+      - name: Pin Android Kotlin JVM target
+        run: npm run android:pin-kotlin-jvm
+
       - name: Make Gradlew executable
         run: chmod +x android/gradlew
 
