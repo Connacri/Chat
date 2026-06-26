@@ -1,50 +1,41 @@
-# Implementation Plan - Automatic Registration and SIM Selection
+# Implementation Plan - Global Safe Area and SIM Features
 
-This plan outlines the changes needed to automate the onboarding process for Nexus Chat by detecting the user's phone number(s) from their SIM card(s) and performing automatic registration.
+This plan outlines the changes needed to ensure all UI elements respect the Safe Area (especially on modern mobile devices) and to finalize the SIM-based automatic registration.
 
 ## User Review Required
 
-- **SIM Detection Accuracy**: The current "SIM detection" is a deterministic simulation based on a hardware ID. Real SIM detection on Android requires native Capacitor plugins and specific permissions. I will enhance the simulation to support multiple "SIMs" and provide a choice if multiple are found.
-- **Masking Logic**: I will implement masking showing only the last 3 digits of the phone number (e.g., `*******123`).
-- **Profile Completion**: Registration will be automatic with minimal info. Users can complete their profile (name, bio, etc.) later from the Settings/Profile screen.
+- **Global Safe Area Implementation**: I will define CSS variables for safe area insets and apply them to the root container and specific components like headers, footers, and forms.
+- **Form Panning**: Ensure forms are not obscured by the keyboard or screen cutouts by adding consistent padding.
 
 ## Proposed Changes
 
-### Core Logic & Utilities
+### Styling Refactor
 
-#### [App.jsx](file:///C:/Users/gzers/AndroidStudioProjects/Chat2/src/App.jsx)
+#### [index.css](file:///C:/Users/gzers/AndroidStudioProjects/Chat2/src/index.css)
 
-- **New View**: `SIM_SELECT` added to `VIEWS`.
-- **Enhanced SIM Detection**: Update `getDetectedPhoneNumber` to return an array of simulated phone numbers if needed, or refine the deterministic generation.
-- **Auto-Registration Function**: Implement `autoRegister(phone)` which creates an identity and a basic user profile (masked phone as name).
-- **Boot Flow Update**: In the initial `useEffect`, if no user is found, trigger SIM detection.
-    - If 1 SIM is found: Auto-register and go to `HOME`.
-    - If >1 SIM is found: Show `SIM_SELECT` screen.
-- **Masking Utility**: Add `maskPhone(phone)` to hide all but the last 3 digits.
-- **Login Screen Update**: Add a clear "Entrer" button to the login form.
+- Add `:root` variables for `safe-area-top`, `safe-area-bottom`, `safe-area-left`, and `safe-area-right` using `env(safe-area-inset-*)`.
+- Update `.app-container` to include horizontal safe area padding.
+- Update `header` to use `var(--safe-area-top)`.
+- Update navigation and chat input bars to use `var(--safe-area-bottom)`.
 
 ---
 
-### UI Components
+### UI Components Refactor
 
-#### [SIMSelectionScreen (NEW)]
+#### [App.jsx](file:///C:/Users/gzers/AndroidStudioProjects/Chat2/src/App.jsx)
 
-- A new screen to allow users to choose between detected SIMs.
-- Shown only if multiple SIMs are detected on boot.
-
-#### [Profile/Chat components]
-
-- Update display logic to show the masked phone number if the user hasn't set a custom name.
+- **`Screen` Component**: Update to ensure internal padding respects safe areas and that content is scrollable if it exceeds the view.
+- **`AppShell` Component**: Standardize the header and navigation padding using the new CSS variables.
+- **`SIMSelectionScreen`**: Update layout to be within the safe area.
+- **`ChatScreen`**: Ensure the message list and input bar correctly handle top/bottom safe areas.
+- **`ProfileScreen` & `DiscoverScreen`**: Fix hero images and filter panels to respect safe areas.
 
 ## Verification Plan
 
-### Automated Tests
-- I will verify the logic by running the application and checking the boot flow.
-- Since I don't have a real Android device with multiple SIMs, I will simulate multiple SIMs by modifying the `nodeId` or `getDetectedPhoneNumber` function during testing.
-
 ### Manual Verification
-1.  **Fresh Install Simulation**: Clear IndexedDB/Local Storage and reload.
-2.  **Single SIM Flow**: Verify that the app automatically registers and opens the `HOME` screen with a masked phone number as name.
-3.  **Multiple SIM Flow**: Manually trigger the multiple SIM condition and verify the selection screen appears.
-4.  **Login Screen**: Verify the new "Entrer" button is present and functional.
-5.  **Masking**: Check that other users (simulated or real) see the masked phone number if no name is set.
+1.  **Browser Emulation**: Use Chrome/Edge DevTools to emulate mobile devices with "Notch" or "Safe Area" (e.g., iPhone 12/13/14).
+2.  **Visual Check**:
+    - Verify that the title bar (Nexus P2P) is not cut off by the camera notch.
+    - Verify that the bottom navigation bar and chat input are not covered by the home indicator or rounded corners.
+    - Check all forms (Register, Login, Edit Profile, Create Group) to ensure they have consistent padding and are fully visible.
+3.  **Scroll Check**: Ensure that content can be scrolled into view even when the keyboard is open (if possible to test in emulator).

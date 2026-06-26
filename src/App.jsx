@@ -98,19 +98,34 @@ const VIEWS = {
   FRIENDS: "friends", GROUPS: "groups", DISCOVER: "discover",
   SETTINGS: "settings", ADMIN: "admin", ADD_FRIEND: "add_friend",
   CREATE_GROUP: "create_group", GROUP_CHAT: "group_chat",
-  EDIT_PROFILE: "edit_profile", OTP: "otp",
+  EDIT_PROFILE: "edit_profile", OTP: "otp", SIM_SELECT: "sim_select",
+};
+
+// Masquage du numéro de téléphone (cache tout sauf les 3 derniers chiffres)
+const maskPhoneNumber = (phone) => {
+  if (!phone) return "*******";
+  const clean = phone.replace(/[\s\-()]/g, '');
+  if (clean.length <= 3) return clean;
+  return "*".repeat(clean.length - 3) + clean.slice(-3);
 };
 
 // Détermination déterministe du numéro de téléphone basé sur l'identifiant unique du nœud de l'appareil (simulation de la carte SIM matérielle de Guinée)
-const getDetectedPhoneNumber = (nodeId) => {
-  if (!nodeId) return "+224 600 00 00 00";
+const getDetectedPhoneNumbers = (nodeId) => {
+  if (!nodeId) return ["+224 600 00 00 00"];
+
+  // Simulation de deux SIMs basées sur le hash pour le test du choix multiple
   let hash = 0;
   for (let i = 0; i < nodeId.length; i++) {
     hash = nodeId.charCodeAt(i) + ((hash << 5) - hash);
   }
-  const lastDigits = Math.abs(hash % 100000000).toString().padStart(8, '0');
-  // Format national guinéen standard (ex: +224 620 12 34 56)
-  return `+224 6${lastDigits.slice(0, 2)} ${lastDigits.slice(2, 4)} ${lastDigits.slice(4, 6)} ${lastDigits.slice(6, 8)}`;
+
+  const generate = (seed) => {
+    const lastDigits = Math.abs((hash + seed) % 100000000).toString().padStart(8, '0');
+    return `+224 6${lastDigits.slice(0, 2)} ${lastDigits.slice(2, 4)} ${lastDigits.slice(4, 6)} ${lastDigits.slice(6, 8)}`;
+  };
+
+  // Pour le moment, on retourne 2 SIMs pour permettre le choix si c'est la première fois
+  return [generate(0), generate(123456)];
 };
 
 // Compression et redimensionnement d'image pour respecter la limite de taille Firestore (1 Mo)
@@ -175,6 +190,7 @@ export default function App() {
   const [simVerifying, setSimVerifying] = useState(false);
   const [simSteps, setSimSteps] = useState([]);
   const [simStatus, setSimStatus] = useState("pending");
+  const [detectedSims, setDetectedSims] = useState([]);
 
   const showToast = useCallback((msg, type = "info") => {
     setToast({ msg, type });
@@ -244,9 +260,25 @@ export default function App() {
       if (storedState?.id) {
         const user = storedState;
         if (user) { setCurrentUser(user); setView(VIEWS.HOME); }
-        else setView(VIEWS.REGISTER);
+        else {
+          const sims = getDetectedPhoneNumbers(nodeId);
+          setDetectedSims(sims);
+          if (sims.length > 1) {
+            setView(VIEWS.SIM_SELECT);
+          } else {
+            autoRegister(sims[0]);
+          }
+        }
       } else {
-        setTimeout(() => setView(VIEWS.REGISTER), 1800);
+        setTimeout(() => {
+          const sims = getDetectedPhoneNumbers(nodeId);
+          setDetectedSims(sims);
+          if (sims.length > 1) {
+            setView(VIEWS.SIM_SELECT);
+          } else {
+            autoRegister(sims[0]);
+          }
+        }, 1800);
       }
     })();
   }, []);
@@ -305,9 +337,62 @@ export default function App() {
     if (p2p) p2p.gossip(delta);
   }, [p2p]);
 
+  // ── Auto Register ──
+  const autoRegister = useCallback(async (phone) => {
+    triggerSimDetection(async () => {
+      try {
+        const idData = await identity.create(phone);
+        const ecdhPublicKey = await security.init();
+
+        const maskedPseudo = maskPhoneNumber(phone);
+
+        const user = {
+          id: idData.did,
+          name: maskedPseudo, // Default pseudo is masked phone
+          phone: phone,
+          normalizedPhone: phone.replace(/[\s\-()]/g, ''),
+          nodeId: nodeId,
+          publicKey: idData.publicKey,
+          proof: idData.proof,
+          ecdhPublicKey,
+          attestation: idData.attestation,
+          bio: "",
+          avatarColor: avatarColor(maskedPseudo),
+          interests: [],
+          verified: true,
+          premium: false,
+          superAdmin: Object.keys(users).length === 0,
+          photos: [],
+          ts: now(),
+          online: true,
+        };
+
+        await db.put("users", user);
+        await db.put("metadata", { id: "currentUser", ...user });
+
+        try {
+          await setDoc(doc(firestore, "users", user.id), user);
+        } catch (e) {
+          console.error("Failed to save user to Firestore on auto-register:", e);
+        }
+
+        setUsers((prev) => ({ ...prev, [user.id]: user }));
+        setFriends((prev) => ({ ...prev, [user.id]: [] }));
+        await db.put("friends", { id: user.id, list: [] });
+        setCurrentUser(user);
+        setView(VIEWS.HOME);
+        showToast("Bienvenue! Compte créé automatiquement via SIM. 🎉", "success");
+      } catch (err) {
+        console.error("Auto-registration error:", err);
+        showToast("Échec de l'inscription automatique : " + err.message, "error");
+        setView(VIEWS.REGISTER);
+      }
+    });
+  }, [nodeId, triggerSimDetection, users, showToast]);
+
   // ── Register / Login ──
   const registerUser = useCallback(async (data) => {
-    const phoneToUse = data.phone || getDetectedPhoneNumber(nodeId);
+    const phoneToUse = data.phone || getDetectedPhoneNumbers(nodeId)[0];
     
     triggerSimDetection(async () => {
       try {
@@ -367,7 +452,7 @@ export default function App() {
 
   const verifySimNumber = useCallback(async () => {
     if (!currentUser) return;
-    const detectedPhone = getDetectedPhoneNumber(nodeId);
+    const detectedPhone = getDetectedPhoneNumbers(nodeId)[0];
     
     triggerSimDetection(async () => {
         const ecdhPublicKey = await security.init();
@@ -611,7 +696,7 @@ const ctx = {
     addFriend, createGroup, updateProfile, toggleOnline, getLocation,
     showToast, nodeId,
     simVerifying, simSteps, simStatus, triggerSimDetection, verifySimNumber,
-    getDetectedPhoneNumber
+    getDetectedPhoneNumbers, autoRegister, detectedSims
   };
 
   // ─── Router ───────────────────────────────────────────────
@@ -620,6 +705,7 @@ const ctx = {
       {toast && <Toast {...toast} />}
       {simVerifying && <SIMVerificationOverlay ctx={ctx} />}
       {view === VIEWS.SPLASH && <SplashScreen />}
+      {view === VIEWS.SIM_SELECT && <SIMSelectionScreen ctx={ctx} />}
       {view === VIEWS.REGISTER && <RegisterScreen ctx={ctx} />}
       {view === VIEWS.LOGIN && <LoginScreen ctx={ctx} />}
       {view === VIEWS.OTP && <OTPScreen ctx={ctx} />}
@@ -672,7 +758,9 @@ function Screen({ title, subtitle, back, children }) {
       flexDirection: 'column',
       gap: '16px',
       minHeight: '100vh',
-      background: '#09090f'
+      background: '#09090f',
+      overflowY: 'auto',
+      boxSizing: 'border-box'
     }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
         {back && <button onClick={back} style={{ background: '#1c1c2e', padding: '8px 12px', borderRadius: '8px', border: 'none', color: '#fff', cursor: 'pointer' }}>←</button>}
@@ -681,7 +769,9 @@ function Screen({ title, subtitle, back, children }) {
           {subtitle && <p style={{ margin: 0, fontSize: '0.85rem', color: 'var(--text-dim)' }}>{subtitle}</p>}
         </div>
       </div>
-      {children}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', flex: 1 }}>
+        {children}
+      </div>
     </div>
   );
 }
@@ -810,7 +900,9 @@ function AppShell({ children, activeTab, ctx, noNav = false }) {
       display: 'flex',
       flexDirection: 'column',
       background: '#09090f',
-      overflow: 'hidden'
+      overflow: 'hidden',
+      paddingLeft: 'var(--safe-area-left)',
+      paddingRight: 'var(--safe-area-right)'
     }}>
       {/* Header with Safe Area Top Padding */}
       <header style={{
@@ -847,7 +939,7 @@ function AppShell({ children, activeTab, ctx, noNav = false }) {
         flex: 1,
         overflowY: 'auto',
         WebkitOverflowScrolling: 'touch', // Smooth scroll on iOS
-        paddingBottom: noNav ? 'calc(20px + var(--safe-area-bottom))' : '100px'
+        paddingBottom: noNav ? 'calc(20px + var(--safe-area-bottom))' : 'calc(100px + var(--safe-area-bottom))'
       }}>
         {children}
       </main>
@@ -857,8 +949,8 @@ function AppShell({ children, activeTab, ctx, noNav = false }) {
         <nav className="tabs-navigation" style={{
           position: 'fixed',
           bottom: 'calc(12px + var(--safe-area-bottom))',
-          left: '12px',
-          right: '12px',
+          left: 'calc(12px + var(--safe-area-left))',
+          right: 'calc(12px + var(--safe-area-right))',
           maxWidth: '476px',
           margin: '0 auto',
           borderRadius: '24px',
@@ -936,7 +1028,7 @@ function SplashScreen() {
 
 // ─── Register ────────────────────────────────────────────────
 function RegisterScreen({ ctx }) {
-  const detectedPhone = useMemo(() => ctx.getDetectedPhoneNumber(ctx.nodeId), [ctx.nodeId, ctx.getDetectedPhoneNumber]);
+  const detectedPhone = useMemo(() => ctx.getDetectedPhoneNumbers(ctx.nodeId)[0], [ctx.nodeId, ctx.getDetectedPhoneNumbers]);
   const [form, setForm] = useState({ name: "", phone: detectedPhone, bio: "", age: "", gender: "autre", city: "", interests: "" });
   const set = (k) => (e) => setForm((p) => ({ ...p, [k]: e.target.value }));
 
@@ -980,7 +1072,7 @@ function RegisterScreen({ ctx }) {
 
 // ─── Login ───────────────────────────────────────────────────
 function LoginScreen({ ctx }) {
-  const detectedPhone = useMemo(() => ctx.getDetectedPhoneNumber(ctx.nodeId), [ctx.nodeId, ctx.getDetectedPhoneNumber]);
+  const detectedPhone = useMemo(() => ctx.getDetectedPhoneNumbers(ctx.nodeId)[0], [ctx.nodeId, ctx.getDetectedPhoneNumbers]);
   const [phone, setPhone] = useState(detectedPhone);
 
   useEffect(() => {
@@ -1049,6 +1141,7 @@ function LoginScreen({ ctx }) {
       </div>
 
       <Btn label="Se connecter via carte SIM" onClick={login} full style={{ marginTop: '10px' }} />
+      <Btn label="Entrer" onClick={login} full secondary style={{ marginTop: '10px' }} />
       <p style={{ textAlign: "center", color: "#888", fontSize: 13, marginTop: 16 }}>
         Nouveau sur Nexus?{" "}
         <span style={{ color: "#6C63FF", cursor: "pointer", fontWeight: 'bold' }} onClick={() => ctx.setView(VIEWS.REGISTER)}>Créer un compte</span>
@@ -1119,7 +1212,7 @@ function HomeScreen({ ctx }) {
 
 function ChatRow({ chat, ctx }) {
   const isGroup = chat.type === "group";
-  const name = isGroup ? chat.group.name : chat.user.name;
+  const name = isGroup ? chat.group.name : (chat.user.name || maskPhoneNumber(chat.user.phone));
   const avatar = isGroup ? null : chat.user.photos?.[0];
   const color = isGroup ? "#6C63FF" : avatarColor(chat.user.name);
   const lastMsg = chat.last;
@@ -1204,15 +1297,16 @@ function ChatScreen({ ctx, isGroup }) {
   if (!chat) return null;
 
   const otherUser = !isGroup ? ctx.users[chat.user?.id] : null;
+  const displayName = isGroup ? chat.name : (otherUser?.name || maskPhoneNumber(otherUser?.phone) || chat.name);
 
   return (
     <div className="app-container" style={{ height: "100vh", display: "flex", flexDirection: "column", overflow: 'hidden' }}>
       {/* Header */}
       <div className="chat-header" style={{ paddingTop: 'calc(12px + var(--safe-area-top))' }}>
         <IconBtn icon="←" onClick={() => ctx.setView(isGroup ? VIEWS.GROUPS : VIEWS.HOME)} />
-        <Avatar name={chat.name} avatar={isGroup ? null : otherUser?.photos?.[0]} color={avatarColor(chat.name)} size={38} verified={otherUser?.verified} />
+        <Avatar name={displayName} avatar={isGroup ? null : otherUser?.photos?.[0]} color={avatarColor(displayName)} size={38} verified={otherUser?.verified} />
         <div style={{ flex: 1, marginLeft: '4px' }}>
-          <div style={{ fontWeight: 700, fontSize: 14.5, color: "#fff" }}>{chat.name}</div>
+          <div style={{ fontWeight: 700, fontSize: 14.5, color: "#fff" }}>{displayName}</div>
           <div style={{ fontSize: 11, color: "var(--secondary)" }}>
             {isGroup ? `${chat.group?.members?.length || 0} membres` : (otherUser?.online ? "En ligne" : "Hors ligne")}
           </div>
@@ -1311,6 +1405,7 @@ const bg = isMe ? "linear-gradient(135deg, var(--primary), var(--secondary))" : 
 function ProfileScreen({ ctx }) {
   const user = ctx.selectedChat?.id ? ctx.users[ctx.selectedChat.id] || ctx.selectedChat : ctx.currentUser;
   const isMe = user?.id === ctx.currentUser?.id;
+  const displayName = user?.name || maskPhoneNumber(user?.phone);
   const maxPhotos = user?.premium ? 10 : 3;
   const photos = user?.photos || [];
 
@@ -1331,13 +1426,13 @@ function ProfileScreen({ ctx }) {
         ) : (
           <div style={{ display: 'flex', height: '100%', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', gap: 12 }}>
             <div style={{ width: 100, height: 100, borderRadius: "50%", background: user.avatarColor, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 36, fontWeight: 800, color: "#fff", border: "4px solid rgba(255,255,255,0.15)" }}>
-              {initials(user.name)}
+              {initials(displayName)}
             </div>
           </div>
         )}
         <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, background: "linear-gradient(transparent, #09090f)", padding: "40px 20px 16px" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <div style={{ fontSize: 24, fontWeight: 800, color: "#fff", fontFamily: 'Outfit' }}>{user.name}</div>
+            <div style={{ fontSize: 24, fontWeight: 800, color: "#fff", fontFamily: 'Outfit' }}>{displayName}</div>
             {user.verified && <span title="Numéro vérifié" style={{ fontSize: 18 }}>✅</span>}
             {user.premium && <span className="badge-premium">PRO</span>}
           </div>
@@ -1563,15 +1658,15 @@ function FriendsScreen({ ctx }) {
               ctx.setSelectedChat(friend);
               ctx.setView(VIEWS.PROFILE);
             }}>
-              <Avatar name={friend.name} avatar={friend.photos?.[0]} color={avatarColor(friend.name)} size={48} verified={friend.verified} />
+              <Avatar name={friend.name || maskPhoneNumber(friend.phone)} avatar={friend.photos?.[0]} color={avatarColor(friend.name || maskPhoneNumber(friend.phone))} size={48} verified={friend.verified} />
               <div style={{ flex: 1 }}>
-                <div style={{ fontWeight: 700, fontSize: 14.5, color: "#fff" }}>{friend.name}</div>
-                <div style={{ fontSize: 12, color: "var(--text-dim)" }}>{friend.city || friend.phone}</div>
+                <div style={{ fontWeight: 700, fontSize: 14.5, color: "#fff" }}>{friend.name || maskPhoneNumber(friend.phone)}</div>
+                <div style={{ fontSize: 12, color: "var(--text-dim)" }}>{friend.city || maskPhoneNumber(friend.phone)}</div>
               </div>
               <Btn label="Message" onClick={(e) => {
                 e.stopPropagation();
                 const chatId = [ctx.currentUser.id, friend.id].sort().join("_");
-                ctx.setSelectedChat({ id: chatId, name: friend.name, user: friend });
+                ctx.setSelectedChat({ id: chatId, name: friend.name || maskPhoneNumber(friend.phone), user: friend });
                 ctx.setView(VIEWS.CHAT);
               }} small style={{ padding: '8px 14px', borderRadius: '8px', fontSize: '0.75rem' }} />
             </div>
@@ -1741,10 +1836,10 @@ function AddFriendScreen({ ctx }) {
           {result === "not_found" && <div style={{ color: "var(--accent)", textAlign: "center", marginTop: 12, fontSize: 13.5 }}>Aucun utilisateur trouvé</div>}
           {result && result !== "not_found" && (
             <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 16, background: '#161626', padding: '12px', borderRadius: '12px' }}>
-              <Avatar name={result.name} avatar={result.photos?.[0]} color={avatarColor(result.name)} size={44} verified={result.verified} />
+              <Avatar name={result.name || maskPhoneNumber(result.phone)} avatar={result.photos?.[0]} color={avatarColor(result.name || maskPhoneNumber(result.phone))} size={44} verified={result.verified} />
               <div style={{ flex: 1 }}>
-                <div style={{ fontWeight: 700, color: "#fff" }}>{result.name}</div>
-                <div style={{ color: "var(--text-dim)", fontSize: 12 }}>{result.city}</div>
+                <div style={{ fontWeight: 700, color: "#fff" }}>{result.name || maskPhoneNumber(result.phone)}</div>
+                <div style={{ color: "var(--text-dim)", fontSize: 12 }}>{result.city || maskPhoneNumber(result.phone)}</div>
               </div>
               {myFriends.includes(result.id) ? (
                 <span style={{ color: "var(--success)", fontSize: 13, fontWeight: 'bold' }}>✓ Ami</span>
@@ -1806,9 +1901,9 @@ function AddFriendScreen({ ctx }) {
             <div style={{ textAlign: 'left' }}>
               {Object.values(ctx.users).filter((u) => u.id !== myId).sort((a,b) => (b.ts || 0) - (a.ts || 0)).map((u) => (
                 <div key={u.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: "1px solid rgba(255,255,255,0.05)" }}>
-                  <Avatar name={u.name} avatar={u.photos?.[0]} color={avatarColor(u.name)} size={36} />
+                  <Avatar name={u.name || maskPhoneNumber(u.phone)} avatar={u.photos?.[0]} color={avatarColor(u.name || maskPhoneNumber(u.phone))} size={36} />
                   <div style={{ flex: 1, fontSize: 13, color: "#ccc" }}>
-                    {u.name}
+                    {u.name || maskPhoneNumber(u.phone)}
                     {u.online && (u.ts > Date.now() - 45000) && (
                       <span style={{
                         display: 'inline-block',
@@ -1903,8 +1998,8 @@ function CreateGroupScreen({ ctx }) {
           <div style={{ color: "var(--text-dim)", fontSize: 13, padding: 12, textAlign: 'center' }}>Ajoutez d'abord des amis</div>
         ) : myFriends.map((f) => (
           <div key={f.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 0", borderBottom: "1px solid rgba(255,255,255,0.05)", cursor: "pointer" }} onClick={() => toggle(f.id)}>
-            <Avatar name={f.name} avatar={f.photos?.[0]} color={avatarColor(f.name)} size={40} />
-            <div style={{ flex: 1, color: "#fff", fontSize: 14 }}>{f.name}</div>
+            <Avatar name={f.name || maskPhoneNumber(f.phone)} avatar={f.photos?.[0]} color={avatarColor(f.name || maskPhoneNumber(f.phone))} size={40} />
+            <div style={{ flex: 1, color: "#fff", fontSize: 14 }}>{f.name || maskPhoneNumber(f.phone)}</div>
             <div style={{
               width: 22,
               height: 22,
@@ -2044,7 +2139,7 @@ function DiscoverScreen({ ctx }) {
 
                 <div className="hero-info">
                   <h2>
-                    {activeProfile.name}, {activeProfile.age || 'Non renseigné'}
+                    {activeProfile.name || maskPhoneNumber(activeProfile.phone)}, {activeProfile.age || 'Non renseigné'}
                     {activeProfile.verified && <span title="Numéro vérifié" style={{ fontSize: '1.2rem' }}>✅</span>}
                     {activeProfile.premium && <span className="badge-premium">PREMIUM</span>}
                   </h2>
@@ -2202,7 +2297,15 @@ function AdminScreen({ ctx }) {
   }, [allUsers]);
 
   return (
-    <div className="login" style={{ padding: '24px', display: 'flex', flexDirection: 'column', gap: '16px', minHeight: '100vh' }}>
+    <div className="login" style={{
+      padding: 'calc(24px + var(--safe-area-top)) 24px calc(24px + var(--safe-area-bottom)) 24px',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '16px',
+      minHeight: '100vh',
+      boxSizing: 'border-box',
+      overflowY: 'auto'
+    }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
         <button onClick={() => ctx.setView(VIEWS.PROFILE)} style={{ background: '#1c1c2e', padding: '8px 12px', borderRadius: '8px', border: 'none', color: '#fff', cursor: 'pointer' }}>←</button>
         <div>
@@ -2234,7 +2337,7 @@ function AdminScreen({ ctx }) {
           <tbody>
             {allUsers.map(u => (
               <tr key={u.id}>
-                <td>{u.name} {u.superAdmin && '👑'}</td>
+                <td>{u.name || maskPhoneNumber(u.phone)} {u.superAdmin && '👑'}</td>
                 <td>{u.phone}</td>
                 <td>{u.verified ? '✅ SIM' : '❌'}{u.premium ? ' ⭐ Pro' : ''}</td>
               </tr>
@@ -2246,9 +2349,50 @@ function AdminScreen({ ctx }) {
   );
 }
 
+// ─── SIM Selection Screen ──────────────────────────────────────────
+function SIMSelectionScreen({ ctx }) {
+  return (
+    <Screen title="Choisir une SIM" subtitle="Plusieurs cartes SIM détectées">
+      <div style={{ background: "rgba(108, 99, 255, 0.08)", border: "var(--glass-border)", borderRadius: 16, padding: 20, marginBottom: 12, textAlign: "center" }}>
+        <div style={{ fontSize: 40, marginBottom: 8 }}>📇</div>
+        <p style={{ fontSize: 13, color: "var(--text-dim)", marginBottom: 20 }}>
+          Veuillez sélectionner le numéro de téléphone que vous souhaitez utiliser pour votre identité Nexus.
+        </p>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+          {ctx.detectedSims.map((phone, idx) => (
+            <button
+              key={idx}
+              onClick={() => ctx.autoRegister(phone)}
+              style={{
+                background: '#1c1c2e',
+                border: '1px solid rgba(108, 99, 255, 0.3)',
+                color: '#fff',
+                padding: '16px',
+                borderRadius: '12px',
+                textAlign: 'left',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '12px',
+                cursor: 'pointer',
+                transition: 'all 0.2s ease'
+              }}
+            >
+              <div style={{ width: 32, height: 32, borderRadius: '50%', background: 'var(--primary)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14 }}>
+                {idx + 1}
+              </div>
+              <div style={{ fontWeight: 600 }}>{phone}</div>
+            </button>
+          ))}
+        </div>
+      </div>
+      <Btn label="Entrer manuellement" onClick={() => ctx.setView(VIEWS.REGISTER)} full secondary />
+    </Screen>
+  );
+}
+
 // ─── SIM Cryptographic Verification Overlay ───
 function SIMVerificationOverlay({ ctx }) {
-  const detectedPhone = useMemo(() => ctx.getDetectedPhoneNumber(ctx.nodeId), [ctx.nodeId, ctx.getDetectedPhoneNumber]);
+  const detectedPhone = useMemo(() => ctx.getDetectedPhoneNumbers(ctx.nodeId)[0], [ctx.nodeId, ctx.getDetectedPhoneNumbers]);
   return (
     <div style={{
       position: 'fixed',
