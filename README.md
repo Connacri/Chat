@@ -5,6 +5,9 @@
 ![Nexus](https://img.shields.io/badge/Security-E2EE-orange)
 ![Nexus](https://img.shields.io/badge/Platform-Android%20%7C%20Web-blue)
 
+[![Download APK](https://img.shields.io/badge/Download-Android%20APK-success?style=for-the-badge&logo=android)](https://github.com/your-repo/nexus/releases/latest)
+[![Open Web App](https://img.shields.io/badge/Open-Web%20App-blue?style=for-the-badge&logo=googlechrome)](https://your-deployment-url.com)
+
 Nexus Chat is a revolutionary social application designed to function entirely without central servers or third-party dependencies (like Firebase). It uses advanced peer-to-peer protocols to ensure privacy, censorship resistance, and offline functionality.
 
 ## ✨ Key Features
