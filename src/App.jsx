@@ -198,6 +198,13 @@ export default function App() {
   }, []);
 
   const triggerSimDetection = useCallback((onComplete) => {
+    if (!Capacitor.isNativePlatform()) {
+      setSimVerifying(false);
+      Promise.resolve(onComplete()).catch(err => {
+        console.error("Error in triggerSimDetection callback:", err);
+      });
+      return;
+    }
     setSimVerifying(true);
     setSimStatus("pending");
     setSimSteps([]);
@@ -220,7 +227,9 @@ export default function App() {
         setSimStatus("success");
         setTimeout(() => {
           setSimVerifying(false);
-          onComplete();
+          Promise.resolve(onComplete()).catch(err => {
+            console.error("Error in triggerSimDetection callback:", err);
+          });
         }, 800);
       }
     }, 400);
@@ -396,8 +405,12 @@ export default function App() {
 
   // ── Register / Login ──
   const registerUser = useCallback(async (data) => {
-    let phoneToUse = data.phone;
+    let phoneToUse = data.phone?.trim();
     if (!phoneToUse && detectedSims.length > 0) phoneToUse = detectedSims[0];
+    if (!phoneToUse) {
+      showToast("Numéro de téléphone requis pour l'inscription", "error");
+      return;
+    }
     
     triggerSimDetection(async () => {
       try {
@@ -466,11 +479,9 @@ export default function App() {
     }
     
     triggerSimDetection(async () => {
-        const ecdhPublicKey = await security.init();
       try {
-        const idData = await identity.create(detectedPhone);
-        
         const ecdhPublicKey = await security.init();
+        const idData = await identity.create(detectedPhone);
         const updated = {
           ...currentUser,
           phone: detectedPhone,
@@ -1054,6 +1065,7 @@ function RegisterScreen({ ctx }) {
 
   const submit = () => {
     if (!form.name.trim()) { ctx.showToast("Nom complet requis", "error"); return; }
+    if (!form.phone.trim()) { ctx.showToast("Numéro de téléphone requis", "error"); return; }
     ctx.registerUser({ ...form, interests: form.interests.split(",").map((i) => i.trim()).filter(Boolean) });
   };
 
@@ -1117,10 +1129,12 @@ function LoginScreen({ ctx }) {
   }, [ctx.detectedSims]);
 
   const login = async () => {
+    const phoneToUse = phone.trim();
+    if (!phoneToUse) {
+      ctx.showToast("Veuillez entrer votre numéro de téléphone", "error");
+      return;
+    }
     ctx.triggerSimDetection(async () => {
-      const phoneToUse = phone.trim();
-      if (!phoneToUse) return;
-      
       const cleanPhoneToUse = phoneToUse.replace(/[\s\-()]/g, '');
 
       let user = Object.values(ctx.users).find((u) => {
